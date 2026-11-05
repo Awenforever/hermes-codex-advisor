@@ -1,0 +1,55 @@
+name: hermes-codex-advisor
+version: 0.1.0
+manifest_version: 1
+api_version: 1
+description: Persistent Codex advisor for Hermes — one durable thread per session, ask/judge/verify, survives restarts.
+author: Awenforever
+license: MIT
+homepage: https://github.com/Awenforever/hermes-codex-advisor
+tags: [advisor, codex, reasoning, plugin]
+requires_hermes: ">=0.21.3"
+
+provides_tools:
+  - codex_ask
+  - codex_status
+  - codex_new
+provides_commands:
+  - advisor
+
+config_schema:
+  model:
+    type: str
+    default: "gpt-6-luna"
+    description: Codex model for the advisor thread. Pinned by policy; do not downgrade.
+  effort:
+    type: str
+    default: "max"
+    description: Reasoning effort (low|medium|high|xhigh|max). Pinned by policy.
+  codex_binary:
+    type: str
+    default: "/opt/data/bin/codex"
+    description: Path to the codex CLI that provides `app-server`.
+  timeout_seconds:
+    type: int
+    default: 300
+    description: Max seconds to wait for one advisor answer.
+  sandbox:
+    type: str
+    default: "read-only"
+    description: Sandbox for advisor turns. The advisor reads and judges; it does not edit files.
+  digest_turns:
+    type: int
+    default: 6
+    description: When a thread must be recreated, how many recent Q/A turns to replay as a digest.
+  max_answer_chars:
+    type: int
+    default: 12000
+    description: Truncate very long answers before returning them to the agent.
+  workspace:
+    type: str
+    default: ""
+    description: Default working directory for advisor turns. Empty = process cwd.
+  state_path:
+    type: str
+    default: "/opt/data/plugin-data/hermes-codex-advisor/state.json"
+    description: Where session↔thread bindings and the Q/A digest are persisted.
