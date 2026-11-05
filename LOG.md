@@ -69,3 +69,27 @@
 - 发布/推送：插件仓库 `4d20d40`；协作中心同步
 - 当前状态：M1 完成，模型/effort 仍是 luna+max
 - Residual：R3（`/advisor` 参数路径）、R4（并发压测）、R5（L0–L4 分级）、R6（公开仓库）
+
+### 2026-11-05 12:00–12:25 +0800 · M2：并发/失联/挂死三类失效的处置
+
+- 执行周期：from 2026-11-05 12:00 +0800 to 2026-11-05 12:25 +0800
+- 触发：顾问自己在上一次回答里点出「app-server 失联但 gateway 仍当它可用，有没有健康检查和恢复机制？」——确实没有
+- 基线：`3cebe8e`
+
+**做了什么**
+
+1. **超时不是失效，静默才是**：`AdvisorSession` 加 `idle_timeout`（默认 90s）。一轮里连续 N 秒没有任何事件 → 判 wedged：发 `turn/interrupt`、会话标记 dead（`mark_dead`）、下次调用自动重启进程，并把原因写进错误
+2. **并发 fail-fast**：整轮持锁，第二个调用最多等 `busy_wait`（默认 5s），超时立刻回「顾问正忙」——排在 5 分钟的大轮后面，对调用方来说和挂死没区别
+3. **传输层失败隔离重试**：进程死/失联/无响应这类错误 → 丢弃 app-server、再起一个、**用 digest 重放**、重试一次，返回 `recovered=true`。确定性失败（如二进制不存在）不假装重试，如实报错并丢弃坏会话
+4. **健康度持久化**：`Binding` 增加 `last_success_at / consecutive_failures / last_error`，`codex_status` 输出 `health`（ok/idle/degraded/failing）、`busy`、`app_server_dead_reason`
+
+**验证**
+
+- 离线契约测试 20 → **25 项全绿**（新增：busy 快速拒绝、传输失败隔离重试且 digest 重放、静默判死并 interrupt、子进程退出如实上报、健康度 3 连败→failing→成功后回 ok）
+- 真机 `hca_m2_checks.py`：A 确定性失败如实报 + 下次重新 spawn **PASS**；C 健康度计数/最后的错误/健康判定 **PASS**
+- 真机 B（挂死看门狗）：12:15 那轮**触发成功**——错误原文「app-server 无响应：连续 1s 没有事件（阈值 1s），已发中断并把该会话隔离」，随后自动重启重试（`recovered=true`）
+- **B/D 的复验被额度挡住**：12:15 起 Codex 报 `You've hit your usage limit … try again at 3:48 PM`。已挂一次性作业 15:50 跑复验
+
+- 发布/推送：插件仓库（M2 提交）
+- 当前状态：M2 机制完成，成功路径的复验待额度
+- Residual：R4 关闭（并发已处理）；新增 R7 额度恢复后复验 M2-B/D；R3/R5/R6 不变
