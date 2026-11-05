@@ -6,6 +6,7 @@
 - **`codex_status(probe=true)` 线程活性探测**：真的去 Codex 确认绑定线程还在不在。`thread/resume` 是控制面调用，**不消耗 token**——额度耗尽时仍然能回答"我的历史还在吗"，而那正是最想问的时候。
 - **空闲进程回收** `advisor_idle_shutdown_seconds`（默认 900s）：长时间没有问答就关掉 app-server；绑定线程留在 Codex 侧，下次提问由 `thread/resume` 接上（跨进程 resume 已验证）。常驻子进程没人需要时不该一直占着。
 - **digest 按字符预算选**（`advisor_digest_max_chars`，默认 6000）：轮数不是预算，6 轮短问答和 6 轮粘贴日志差两个数量级。最新一轮永远保留。
+- **`/advisor` 子命令**：`status`（默认）/ `probe`（零 token 探测）/ `new [原因]` / `help`，其余按问题处理——斜杠命令没有结构化参数的位置，子命令是唯一干净的入口。
 - 验收分级新增 L4 三项：probe 无绑定时明确报、probe 零 token 续上真实线程、看门狗触发路径细节。
 
 ### Fixed

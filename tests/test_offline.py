@@ -378,6 +378,33 @@ class SessionThreadTests(unittest.TestCase):
         self.assertEqual([c[1]["threadId"] for c in turn_calls], ["t-live", "t-live"])
 
 
+class SessionIsolationTests(unittest.TestCase):
+    """Two Hermes conversations must never share an advisor thread."""
+
+    def test_two_sessions_get_two_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess)
+            svc.ask("session:A", "A 的第一问")
+            a_thread = svc.store.get("session:A").thread_id
+
+            # second conversation starts from scratch: no binding -> new thread expected
+            class SecondSession(FakeSession):
+                def ensure_thread(self, thread_id):
+                    if thread_id:
+                        return super().ensure_thread(thread_id)
+                    self.thread_id = "thread-B"
+                    return self.thread_id, False
+
+            svc2 = build(tmp, SecondSession())
+            svc2.ask("session:B", "B 的第一问")
+            b_thread = svc2.store.get("session:B").thread_id
+            self.assertNotEqual(a_thread, b_thread)
+            # and A's binding is untouched by B's traffic (they share one state file)
+            self.assertEqual(svc2.store.get("session:A").thread_id, a_thread)
+            self.assertEqual(len(svc2.store.get("session:B").turns), 1)
+
+
 class ThreadProbeTests(unittest.TestCase):
     """probe(): answer "is my history still there?" without spending tokens."""
 

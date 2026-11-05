@@ -44,6 +44,7 @@ s6-svc -r /run/service/gateway-default     # 容器内；systemd 环境用 syste
 | `codex_status(probe?)` | 线程 / 模型 / 存活 / 健康度 / 最近一轮；`probe=true` 真去确认线程还在（**不耗 token**）|
 | `codex_new(reason?)` | 重置线程（旧问答仍作摘要保留） |
 | `/advisor <问题>` | 不走工具直接问 |
+| `/advisor status` \| `probe` \| `new [原因]` \| `help` | 子命令：状态 / 零 token 探测 / 换线程 / 用法 |
 
 提问纪律（写进工具描述，agent 会看到）：**只给证据，不给预设推论**。原始输出、文件:行号、约束、验收标准；别写"我认为是 X 导致的"。
 

@@ -97,13 +97,41 @@ def register(ctx) -> None:  # noqa: D401 - plugin entrypoint
     )
 
     def advisor_command(raw_args: str = "") -> str:
+        """`/advisor` — talk to the advisor without going through the tool layer.
+
+        Sub-commands exist because a slash command has no place to pass structured args:
+        ``/advisor status`` (default), ``/advisor probe`` (zero-token liveness),
+        ``/advisor new [reason]`` (rebind thread), anything else is a question.
+        """
         import json
 
-        question = (raw_args or "").strip()
         svc = service()
-        if not question:
-            return json.dumps(svc.status("session:default"), ensure_ascii=False)
-        result = svc.ask("session:default", question)
+        key = "command:advisor"
+        text = (raw_args or "").strip()
+        lowered = text.lower()
+
+        if not text or lowered in {"status", "状态"}:
+            payload = svc.status(key)
+            return json.dumps(
+                {
+                    "thread_id": payload["thread_id"],
+                    "turns_recorded": payload["turns_recorded"],
+                    "health": payload["health"],
+                    "model": f'{payload["model"]} / {payload["effort"]}',
+                    "app_server_alive": payload["app_server_alive"],
+                    "last_turn_at": payload["last_turn_at"],
+                },
+                ensure_ascii=False,
+            )
+        if lowered in {"probe", "探测"}:
+            return json.dumps(svc.probe(key), ensure_ascii=False)
+        if lowered.startswith("new") or lowered.startswith("reset"):
+            reason = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else "via /advisor new"
+            return json.dumps(svc.reset(key, reason=reason), ensure_ascii=False)
+        if lowered in {"help", "?", "/?"}:
+            return "用法：/advisor <问题> | /advisor status | /advisor probe | /advisor new [原因]"
+
+        result = svc.ask(key, text)
         return result.to_payload(max_chars=svc.max_answer_chars)["answer"] or result.error
 
     ctx.register_command(
