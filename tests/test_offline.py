@@ -24,10 +24,13 @@ from advisor.state import StateStore
 class FakeSession:
     """Stand-in for AdvisorSession with scripted behaviour."""
 
-    def __init__(self, *, resume_ok: bool = True, answer: str = "答案 TEXT", error: str = ""):
+    def __init__(self, *, resume_ok: bool = True, answer: str = "答案 TEXT", error: str = "",
+                 fail_first_with: str = ""):
         self.resume_ok = resume_ok
         self.answer = answer
         self.error = error
+        self.fail_first_with = fail_first_with
+        self.dead_reason = ""
         self._alive = True
         self.messages: list[str] = []
         self.thread_ids_used: list[str] = []
@@ -42,6 +45,10 @@ class FakeSession:
         self.closed = True
         self._alive = False
 
+    def mark_dead(self, reason: str) -> None:
+        self.dead_reason = reason
+        self._alive = False
+
     def ensure_thread(self, thread_id: Optional[str]) -> tuple[str, bool]:
         if thread_id and self.resume_ok:
             self.thread_id = thread_id
@@ -53,6 +60,9 @@ class FakeSession:
         assert thread_id, "service must pass an explicit thread_id"
         self.thread_ids_used.append(thread_id)
         self.messages.append(text)
+        if self.fail_first_with:
+            err, self.fail_first_with = self.fail_first_with, ""
+            return TurnOutcome(ok=False, error=err, thread_id=thread_id, elapsed=0.01)
         if self.error:
             return TurnOutcome(ok=False, error=self.error, thread_id=self.thread_id, elapsed=0.01)
         return TurnOutcome(ok=True, text=self.answer, thread_id=self.thread_id, turn_id="turn-1", elapsed=0.02)
@@ -342,6 +352,107 @@ class SessionThreadTests(unittest.TestCase):
         self.assertEqual(methods.count("thread/start"), 0, "an existing thread must never be re-started")
         turn_calls = [c for c in client.calls if c[0] == "turn/start"]
         self.assertEqual([c[1]["threadId"] for c in turn_calls], ["t-live", "t-live"])
+
+
+class ResilienceTests(unittest.TestCase):
+    """M2: busy fail-fast, transport recovery, health verdict."""
+
+    def test_busy_advisor_fails_fast_instead_of_queueing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess, busy_wait=0.05)
+            self.assertTrue(svc._lock.acquire(timeout=1))
+            try:
+                res = svc.ask("session:A", "问一句")
+            finally:
+                svc._lock.release()
+            self.assertFalse(res.ok)
+            self.assertTrue(res.busy)
+            self.assertIn("正忙", res.error)
+            self.assertEqual(sess.messages, [])  # nothing ran while busy
+
+    def test_transport_failure_recovers_once_with_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            made: list[FakeSession] = []
+
+            def factory(**kw):
+                first = not made
+                s = FakeSession(fail_first_with="app-server 无响应：连续 90s 没有事件" if first else "")
+                made.append(s)
+                return s
+
+            svc = AdvisorService(
+                store=StateStore(os.path.join(tmp, "state.json")),
+                session_factory=factory,
+                model="gpt-6-luna", effort="max", sandbox="read-only",
+                codex_bin="/bin/true", codex_home=tmp, cwd=None,
+                timeout=5, digest_turns=6, max_answer_chars=12000,
+            )
+            b = svc.store.get("session:A")
+            b.record("更早的问题", "更早的答案")
+            svc.store.save(b)
+
+            res = svc.ask("session:A", "新问题")
+            self.assertTrue(res.ok, res.error)
+            self.assertTrue(res.recovered)
+            self.assertEqual(len(made), 2, "must quarantine the wedged app-server and start a fresh one")
+            self.assertIn("传输层失败", " ".join(res.notes))
+            retry_msg = made[1].messages[0]
+            self.assertIn("更早的问题", retry_msg)   # digest replayed into the fresh thread
+            self.assertIn("新问题", retry_msg)
+
+    def test_health_declines_with_failures_and_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession(error="turn status=failed: usage limit exceeded")
+            svc = build(tmp, sess)
+            for _ in range(3):
+                svc.ask("session:A", "问")
+            st = svc.status("session:A")
+            self.assertEqual(st["health"], "failing")
+            self.assertEqual(st["consecutive_failures"], 3)
+            self.assertIn("usage limit", st["last_error"])
+
+            sess.error = ""
+            svc.ask("session:A", "问")
+            st2 = svc.status("session:A")
+            self.assertEqual(st2["health"], "ok")
+            self.assertEqual(st2["consecutive_failures"], 0)
+            self.assertTrue(st2["last_success_at"])
+
+
+class HangDetectionTests(unittest.TestCase):
+    def test_silent_app_server_is_declared_dead_not_waited_on(self) -> None:
+        from advisor.session import AdvisorSession
+
+        client = FakeClient()
+        client.is_alive = lambda: True          # process looks alive...
+        # ...but no notification ever arrives: that is a wedge, not slowness.
+        sess = AdvisorSession(
+            codex_bin="/bin/true", codex_home=None, model="gpt-6-luna", effort="max",
+            sandbox="read-only", client_factory=lambda **_: client, idle_timeout=0.2,
+        )
+        tid, _ = sess.ensure_thread(None)
+        outcome = sess.ask("hi", thread_id=tid, timeout=5)
+        self.assertFalse(outcome.ok)
+        self.assertIn("无响应", outcome.error)
+        self.assertFalse(sess.alive(), "a wedged session must be quarantined, not reused")
+        self.assertIn("wedged", sess.dead_reason)
+        self.assertIn("turn/interrupt", [c[0] for c in client.calls])
+
+    def test_dead_child_is_reported_as_exited(self) -> None:
+        from advisor.session import AdvisorSession
+
+        client = FakeClient()
+        client.is_alive = lambda: False
+        sess = AdvisorSession(
+            codex_bin="/bin/true", codex_home=None, model="gpt-6-luna", effort="max",
+            sandbox="read-only", client_factory=lambda **_: client, idle_timeout=90,
+        )
+        tid, _ = sess.ensure_thread(None)
+        outcome = sess.ask("hi", thread_id=tid, timeout=5)
+        self.assertFalse(outcome.ok)
+        self.assertIn("退出", outcome.error)
+        self.assertFalse(sess.alive())
 
 
 class PluginConfigTests(unittest.TestCase):

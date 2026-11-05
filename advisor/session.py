@@ -80,6 +80,7 @@ class AdvisorSession:
         effort: str,
         sandbox: str,
         cwd: Optional[str] = None,
+        idle_timeout: float = 90.0,
         client_factory: Optional[Callable[..., Any]] = None,
     ) -> None:
         self.codex_bin = codex_bin
@@ -88,6 +89,10 @@ class AdvisorSession:
         self.effort = effort
         self.sandbox = sandbox
         self.cwd = cwd
+        # A live child process can still be wedged (stdio open, nothing coming back).
+        # Silence longer than this counts as a hang, not slowness.
+        self.idle_timeout = idle_timeout
+        self._dead_reason = ""
         self._client_factory = client_factory
         self._client: Any = None
         self._projector: Any = None
@@ -128,10 +133,24 @@ class AdvisorSession:
         return self._client
 
     def alive(self) -> bool:
+        """True only when the child is running *and* not known to be wedged."""
+        if self._dead_reason:
+            return False
         try:
             return bool(self._client is not None and self._client.is_alive())
         except Exception:
             return False
+
+    def mark_dead(self, reason: str) -> None:
+        """Quarantine this session; the next call gets a fresh app-server."""
+        if not self._dead_reason:
+            logger.warning("advisor: session marked dead — %s", reason)
+        self._dead_reason = reason
+        self._thread_id = None
+
+    @property
+    def dead_reason(self) -> str:
+        return self._dead_reason
 
     def close(self) -> None:
         if self._client is not None:
@@ -240,19 +259,39 @@ class AdvisorSession:
 
         deadline = started + timeout
         final_text = ""
+        last_activity = time.monotonic()
         while time.monotonic() < deadline:
             # Answer any server request first: codex blocks until we do.
             req = client.take_server_request(timeout=0)
             if req is not None:
+                last_activity = time.monotonic()
                 self._answer_server_request(req)
                 continue
 
             note = client.take_notification(timeout=poll)
             if note is None:
-                if not self.alive():
+                if self._dead_reason:
+                    outcome.error = f"app-server 已失联：{self._dead_reason}"
+                    break
+                try:
+                    child_alive = bool(client.is_alive())
+                except Exception:
+                    child_alive = False
+                if not child_alive:
+                    self.mark_dead("codex app-server 进程退出")
                     outcome.error = "app-server 进程已退出（`codex app-server` died）"
                     break
+                silent_for = time.monotonic() - last_activity
+                if self.idle_timeout and silent_for > self.idle_timeout:
+                    self.interrupt()
+                    self.mark_dead(f"{silent_for:.0f}s 无任何事件（疑似 wedged）")
+                    outcome.error = (
+                        f"app-server 无响应：连续 {silent_for:.0f}s 没有事件（阈值 {self.idle_timeout:.0f}s），"
+                        "已发中断并把该会话隔离，下次调用将重启进程"
+                    )
+                    break
                 continue
+            last_activity = time.monotonic()
 
             method = str(note.get("method") or "")
             if method == "turn/completed":

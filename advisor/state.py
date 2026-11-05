@@ -73,6 +73,10 @@ class Binding:
     turns: list[TurnRecord] = field(default_factory=list)
     # Number of times the bound thread had to be recreated (resume failure).
     restarts: int = 0
+    # Health bookkeeping, persisted so a restart doesn't erase a bad streak.
+    last_success_at: float = 0.0
+    consecutive_failures: int = 0
+    last_error: str = ""
 
     def to_json(self) -> dict[str, Any]:
         data = asdict(self)
@@ -88,6 +92,9 @@ class Binding:
             last_turn_at=float(raw.get("last_turn_at") or 0.0),
             turns=[TurnRecord.from_json(t) for t in (raw.get("turns") or []) if isinstance(t, dict)],
             restarts=int(raw.get("restarts") or 0),
+            last_success_at=float(raw.get("last_success_at") or 0.0),
+            consecutive_failures=int(raw.get("consecutive_failures") or 0),
+            last_error=str(raw.get("last_error") or ""),
         )
 
     def record(self, question: str, answer: str, *, turn_id: str = "", error: str = "", keep: int = 6) -> None:
@@ -104,6 +111,22 @@ class Binding:
         if keep > 0 and len(self.turns) > keep:
             del self.turns[: len(self.turns) - keep]
         self.last_turn_at = time.time()
+        if error:
+            self.consecutive_failures += 1
+            self.last_error = _clip(error, 400)
+        else:
+            self.consecutive_failures = 0
+            self.last_error = ""
+            self.last_success_at = self.last_turn_at
+
+    @property
+    def health(self) -> str:
+        """Coarse verdict so callers don't have to interpret counters themselves."""
+        if self.consecutive_failures >= 3:
+            return "failing"
+        if self.consecutive_failures > 0:
+            return "degraded"
+        return "ok" if self.last_success_at else "idle"
 
     def digest(self, turns: int = 6) -> str:
         """Render recent Q/A as a compact replay block for a fresh thread."""

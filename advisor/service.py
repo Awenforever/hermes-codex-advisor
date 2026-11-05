@@ -50,6 +50,8 @@ class AskResult:
     declined_approvals: int = 0
     error: str = ""
     notes: list[str] = field(default_factory=list)
+    busy: bool = False
+    recovered: bool = False
 
     def to_payload(self, *, max_chars: int = 12000) -> dict[str, Any]:
         answer = self.answer
@@ -69,6 +71,10 @@ class AskResult:
             payload["turn_id"] = self.turn_id
         if self.restarted:
             payload["restarted"] = True
+        if self.recovered:
+            payload["recovered"] = True
+        if self.busy:
+            payload["busy"] = True
         if self.declined_approvals:
             payload["declined_approvals"] = self.declined_approvals
         if self.notes:
@@ -95,6 +101,9 @@ class AdvisorService:
         timeout: float,
         digest_turns: int,
         max_answer_chars: int,
+        idle_timeout: float = 90.0,
+        busy_wait: float = 5.0,
+        retry_on_transport_failure: bool = True,
     ) -> None:
         self.store = store
         self.model = model
@@ -104,6 +113,9 @@ class AdvisorService:
         self.codex_home = codex_home
         self.cwd = cwd
         self.timeout = timeout
+        self.idle_timeout = idle_timeout
+        self.busy_wait = busy_wait
+        self.retry_on_transport_failure = retry_on_transport_failure
         self.digest_turns = digest_turns
         self.max_answer_chars = max_answer_chars
         self._session_factory = session_factory
@@ -125,6 +137,7 @@ class AdvisorService:
             effort=self.effort,
             sandbox=self.sandbox,
             cwd=self.cwd,
+            idle_timeout=self.idle_timeout,
         )
         return self._session
 
@@ -136,70 +149,143 @@ class AdvisorService:
 
     # -- public API -------------------------------------------------------
     def ask(self, session_key: str, question: str, *, extra_context: str = "", fresh: bool = False) -> AskResult:
+        """One advisor question, with an honest answer either way.
+
+        Concurrency: the whole turn holds the lock, so a second caller either waits up to
+        ``busy_wait`` seconds or is told plainly that the advisor is busy. Silently
+        queueing behind a multi-minute turn would look like a hang to the caller.
+        """
         question = (question or "").strip()
         if not question:
             return AskResult(ok=False, error="问题为空", model=self.model, effort=self.effort)
 
-        with self._lock:
-            binding = self.store.get(session_key)
-            if fresh:
-                binding = self.store.reset(session_key, reason="fresh=True")
+        if not self._lock.acquire(timeout=self.busy_wait):
+            return AskResult(
+                ok=False,
+                busy=True,
+                model=self.model,
+                effort=self.effort,
+                error=(
+                    f"顾问正忙：上一轮问答仍在进行，已等待 {self.busy_wait:.0f}s。"
+                    "请稍后重试，或把问题合并成一次提问。"
+                ),
+            )
+        try:
+            return self._ask_locked(session_key, question, extra_context, fresh)
+        finally:
+            self._lock.release()
 
-            result = AskResult(ok=False, model=self.model, effort=self.effort)
-            session = self._get_session()
+    @staticmethod
+    def _is_transport_failure(error: str) -> bool:
+        """Transport-level failure (process/wire), as opposed to a model-level error."""
+        markers = (
+            "app-server", "已失联", "无响应", "进程已退出",
+            "turn/start 失败", "无法建立 codex 线程", "resume 失败",
+        )
+        return any(m in (error or "") for m in markers)
 
-            # 1) bind to the persisted thread (or start one)
-            wanted = binding.thread_id
+    def _discard_session(self) -> None:
+        if self._session is not None:
             try:
-                thread_id, resumed = session.ensure_thread(wanted or None)
+                self._session.close()
+            finally:
+                self._session = None
+
+    def _ask_locked(self, session_key: str, question: str, extra_context: str, fresh: bool) -> AskResult:
+        binding = self.store.get(session_key)
+        if fresh:
+            binding = self.store.reset(session_key, reason="fresh=True")
+
+        result = AskResult(ok=False, model=self.model, effort=self.effort)
+        session = self._get_session()
+
+        # 1) bind to the persisted thread (or start one)
+        wanted = binding.thread_id
+        try:
+            thread_id, resumed = session.ensure_thread(wanted or None)
+        except Exception as exc:
+            # Spawn/protocol failure. Not retried blindly (a missing binary will fail the
+            # same way), but the broken session is dropped so the next call spawns fresh.
+            result.error = f"无法建立 codex 线程：{_short(exc)}"
+            self._discard_session()
+            binding.record(question, "", error=result.error)
+            self.store.save(binding)
+            return result
+
+        result.thread_id = thread_id
+        result.resumed = resumed
+
+        # 2) thread lost? fail-closed: new thread + digest, and SAY SO
+        digest = ""
+        if wanted and not resumed:
+            digest = binding.digest(self.digest_turns)
+            result.restarted = True
+            result.notes.append(
+                f"原线程 {wanted[:8]} 已不可用（resume 失败），已新建线程并用最近 {len(binding.turns[-self.digest_turns:])} 轮问答摘要续接。"
+            )
+            binding.thread_id = thread_id
+            binding.restarts += 1
+        elif not wanted:
+            binding.thread_id = thread_id
+
+        # 3) compose the turn
+        parts: list[str] = []
+        if not resumed:
+            parts.append(ADVISOR_PREAMBLE)
+        if digest:
+            parts.append(digest)
+        if extra_context.strip():
+            parts.append("## 补充证据\n" + extra_context.strip())
+        parts.append("## 问题\n" + question)
+        message = "\n\n".join(parts)
+
+        # 4) run it — and if the transport itself broke, recover once
+        outcome: TurnOutcome = session.ask(message, thread_id=thread_id, timeout=self.timeout)
+        if (
+            not outcome.ok
+            and self.retry_on_transport_failure
+            and self._is_transport_failure(outcome.error)
+        ):
+            self._discard_session()
+            if self._session is not None and hasattr(self._session, "mark_dead"):
+                self._session.mark_dead(outcome.error)
+            result.notes.append(f"传输层失败（{outcome.error}）；已隔离该 app-server 并重启重试一次。")
+            result.recovered = True
+            # Fresh process needs a fresh thread; replay the digest so nothing is lost.
+            digest = binding.digest(self.digest_turns) or digest
+            binding.thread_id = ""
+            binding.restarts += 1
+            session = self._get_session()
+            try:
+                thread_id, resumed = session.ensure_thread(None)
             except Exception as exc:
-                result.error = f"无法建立 codex 线程：{_short(exc)}"
+                result.error = f"重试仍失败：无法建立 codex 线程（{_short(exc)}）"
                 binding.record(question, "", error=result.error)
                 self.store.save(binding)
                 return result
-
             result.thread_id = thread_id
             result.resumed = resumed
-
-            # 2) thread lost? fail-closed: new thread + digest, and SAY SO
-            digest = ""
-            if wanted and not resumed:
-                digest = binding.digest(self.digest_turns)
-                result.restarted = True
-                result.notes.append(
-                    f"原线程 {wanted[:8]} 已不可用（resume 失败），已新建线程并用最近 {len(binding.turns[-self.digest_turns:])} 轮问答摘要续接。"
-                )
-                binding.thread_id = thread_id
-                binding.restarts += 1
-            elif not wanted:
-                binding.thread_id = thread_id
-
-            # 3) compose the turn
-            parts: list[str] = []
-            if not resumed:
-                parts.append(ADVISOR_PREAMBLE)
+            retry_parts = [ADVISOR_PREAMBLE]
             if digest:
-                parts.append(digest)
+                retry_parts.append(digest)
             if extra_context.strip():
-                parts.append("## 补充证据\n" + extra_context.strip())
-            parts.append("## 问题\n" + question)
-            message = "\n\n".join(parts)
+                retry_parts.append("## 补充证据\n" + extra_context.strip())
+            retry_parts.append("## 问题\n" + question)
+            outcome = session.ask("\n\n".join(retry_parts), thread_id=thread_id, timeout=self.timeout)
 
-            # 4) run it
-            outcome: TurnOutcome = session.ask(message, thread_id=thread_id, timeout=self.timeout)
-            result.elapsed = outcome.elapsed
-            result.turn_id = outcome.turn_id
-            result.declined_approvals = outcome.declined_approvals
-            result.ok = outcome.ok
-            result.answer = outcome.text
-            if not outcome.ok:
-                result.error = outcome.error or "未知失败"
+        result.elapsed = outcome.elapsed
+        result.turn_id = outcome.turn_id
+        result.declined_approvals = outcome.declined_approvals
+        result.ok = outcome.ok
+        result.answer = outcome.text
+        if not outcome.ok:
+            result.error = outcome.error or "未知失败"
 
-            # 5) persist (success and failure both — the digest must reflect reality)
-            binding.record(question, result.answer, turn_id=outcome.turn_id, error=result.error)
-            binding.thread_id = thread_id
-            self.store.save(binding)
-            return result
+        # 5) persist (success and failure both — the digest must reflect reality)
+        binding.record(question, result.answer, turn_id=outcome.turn_id, error=result.error)
+        binding.thread_id = thread_id
+        self.store.save(binding)
+        return result
 
     def status(self, session_key: str) -> dict[str, Any]:
         binding: Binding = self.store.get(session_key)
@@ -213,12 +299,19 @@ class AdvisorService:
             "has_thread": bool(binding.thread_id),
             "turns_recorded": len(binding.turns),
             "restarts": binding.restarts,
+            "health": binding.health,
+            "consecutive_failures": binding.consecutive_failures,
+            "last_error": binding.last_error,
+            "last_success_at": _iso(binding.last_success_at),
             "last_turn_at": _iso(binding.last_turn_at),
             "model": self.model,
             "effort": self.effort,
             "sandbox": self.sandbox,
             "app_server_alive": alive,
+            "app_server_dead_reason": getattr(session, "dead_reason", "") if session else "",
+            "busy": self._lock.locked(),
             "timeout_seconds": self.timeout,
+            "idle_timeout_seconds": self.idle_timeout,
             "state_path": str(self.store.path),
             "codex_bin": self.codex_bin,
             "codex_home": self.codex_home,
@@ -278,4 +371,7 @@ def build_service(config: dict[str, Any]) -> AdvisorService:
         timeout=float(config.get("timeout_seconds") or 300),
         digest_turns=int(config.get("digest_turns") or 6),
         max_answer_chars=int(config.get("max_answer_chars") or 12000),
+        idle_timeout=float(config.get("idle_timeout_seconds") or 90),
+        busy_wait=float(config.get("busy_wait_seconds") or 5),
+        retry_on_transport_failure=bool(config.get("retry_on_transport_failure", True)),
     )
