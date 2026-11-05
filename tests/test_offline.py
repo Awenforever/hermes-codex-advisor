@@ -213,5 +213,39 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(sess.messages, [])
 
 
+class PluginConfigTests(unittest.TestCase):
+    """The config reader must degrade to defaults, never take the advisor down."""
+
+    def test_reserved_key_rejection_does_not_crash(self) -> None:
+        from advisor.config import effective_config
+
+        class HostileCtx:
+            """Mimics the host: reserved roots raise, real keys resolve."""
+
+            def get_config(self, key, default=None):
+                if key in {"model", "plugins", "security", "settings"}:
+                    raise ValueError("global, cross-plugin, and traversal paths are forbidden")
+                return {"advisor_model": "gpt-6-luna", "advisor_effort": "max"}.get(key)
+
+        cfg = effective_config(HostileCtx())
+        self.assertEqual(cfg["model"], "gpt-6-luna")
+        self.assertEqual(cfg["effort"], "max")
+        self.assertEqual(cfg["sandbox"], "read-only")  # default survives
+
+    def test_all_keys_unreadable_falls_back_to_defaults(self) -> None:
+        from advisor.config import DEFAULTS, effective_config
+
+        class BrokenCtx:
+            def get_config(self, key, default=None):
+                raise RuntimeError("config subsystem down")
+
+        self.assertEqual(effective_config(BrokenCtx()), DEFAULTS)
+
+    def test_no_ctx_still_yields_defaults(self) -> None:
+        from advisor.config import DEFAULTS, effective_config
+
+        self.assertEqual(effective_config(None), DEFAULTS)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,7 @@ import logging
 import threading
 from typing import Any, Optional
 
+from .advisor.config import effective_config
 from .advisor.service import AdvisorService, build_service
 from .advisor.tools import (
     CODEX_ASK_SCHEMA,
@@ -43,12 +44,8 @@ _SERVICE: Optional[AdvisorService] = None
 
 
 def _config(ctx: Any) -> dict[str, Any]:
-    """Read plugin settings without leaking config access into the advisor layer."""
-    keys = (
-        "model", "effort", "codex_binary", "timeout_seconds", "sandbox",
-        "digest_turns", "max_answer_chars", "workspace", "state_path",
-    )
-    return {k: ctx.get_config(k) for k in keys}
+    """Settings + defaults, resolved by ``advisor.config`` (never raises)."""
+    return effective_config(ctx)
 
 
 def _get_service(ctx: Any) -> AdvisorService:
