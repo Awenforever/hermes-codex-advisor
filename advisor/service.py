@@ -25,6 +25,8 @@ from .state import Binding, StateStore
 
 logger = logging.getLogger("hermes-codex-advisor.service")
 
+PLUGIN_VERSION = "0.4.0"
+
 ADVISOR_PREAMBLE = """你是 Hermes（一个以 deepseek-flash 为主模型的执行型 agent）的私人顾问。
 调用方会把现状、原始证据、约束和验收标准交给你；你的职责是给出**判断**，而不是复述。
 
@@ -52,6 +54,10 @@ class AskResult:
     notes: list[str] = field(default_factory=list)
     busy: bool = False
     recovered: bool = False
+    # Structured failure code so callers can branch without parsing prose:
+    # QUOTA_EXHAUSTED | BUSY | TRANSPORT | TIMEOUT | TIMEOUT_RECOVERED | CONFIG | MODEL | UNKNOWN
+    error_code: str = ""
+    quota: dict[str, Any] = field(default_factory=dict)
 
     def to_payload(self, *, max_chars: int = 12000) -> dict[str, Any]:
         answer = self.answer
@@ -60,7 +66,7 @@ class AskResult:
         payload: dict[str, Any] = {
             "ok": self.ok,
             "answer": answer,
-            "source": "codex-advisor",
+            "source": f"codex-advisor/{PLUGIN_VERSION} · {self.model} · {self.effort}",
             "thread_id": self.thread_id,
             "model": self.model,
             "effort": self.effort,
@@ -81,6 +87,10 @@ class AskResult:
             payload["notes"] = self.notes
         if self.error:
             payload["error"] = self.error
+        if self.error_code:
+            payload["error_code"] = self.error_code
+        if self.quota:
+            payload["quota"] = self.quota
         return payload
 
 
@@ -123,6 +133,13 @@ class AdvisorService:
         # and the next question resumes it (cross-process resume is a proven path).
         self.idle_shutdown = idle_shutdown
         self._last_used = 0.0
+        # The quota read is a network call. Cache it, and after a failure back off for a
+        # while: if the host has no proxy env the call times out, and paying that on every
+        # single ask would turn a nice-to-have pre-flight into a latency tax.
+        self._quota_cache: tuple[float, dict[str, Any]] | None = None
+        self._quota_fail_until = 0.0
+        self.quota_ttl = 60.0
+        self.quota_backoff = 120.0
         self.digest_turns = digest_turns
         self.digest_max_chars = digest_max_chars
         self.max_answer_chars = max_answer_chars
@@ -193,6 +210,7 @@ class AdvisorService:
             return AskResult(
                 ok=False,
                 busy=True,
+                error_code="BUSY",
                 model=self.model,
                 effort=self.effort,
                 error=(
@@ -226,6 +244,32 @@ class AdvisorService:
         )
         return any(m.lower() in (error or "").lower() for m in markers)
 
+    def _recover_after_timeout(self, session: Any, thread_id: str, outcome: TurnOutcome) -> tuple[str, str]:
+        """Read the thread and return (agent_text, turn_id) if our turn actually completed."""
+        try:
+            turns = session.thread_turns(thread_id)
+        except Exception as exc:
+            logger.info("advisor: post-timeout history read failed (%s); reporting the timeout as-is", exc)
+            return "", ""
+        if not turns:
+            return "", ""
+        # Prefer the turn we started; fall back to the newest one.
+        target = None
+        for turn in reversed(turns):
+            if outcome.turn_id and turn.get("id") == outcome.turn_id:
+                target = turn
+                break
+        if target is None:
+            candidate = turns[-1]
+            if outcome.turn_id and candidate.get("id") != outcome.turn_id:
+                return "", ""  # a different turn — not ours to report
+            target = candidate
+        status = str(target.get("status") or "")
+        text = session.turn_agent_text(target)
+        if status in {"completed", "complete"} and text:
+            return text, str(target.get("id") or outcome.turn_id)
+        return "", ""
+
     def _discard_session(self) -> None:
         if self._session is not None:
             try:
@@ -239,6 +283,18 @@ class AdvisorService:
             binding = self.store.reset(session_key, reason="fresh=True")
 
         result = AskResult(ok=False, model=self.model, effort=self.effort)
+
+        # 0) quota pre-flight: a doomed turn should cost nothing and say why.
+        quota = self.quota(lock_held=True)
+        result.quota = quota if quota.get("ok") else {}
+        blocked = self._quota_blocks(quota)
+        if blocked:
+            result.error = blocked
+            result.error_code = "QUOTA_EXHAUSTED"
+            binding.record(question, "", error=blocked)
+            self.store.save(binding)
+            return result
+
         session = self._get_session()
 
         # 1) bind to the persisted thread (or start one)
@@ -249,6 +305,7 @@ class AdvisorService:
             # Spawn/protocol failure. Not retried blindly (a missing binary will fail the
             # same way), but the broken session is dropped so the next call spawns fresh.
             result.error = f"无法建立 codex 线程：{_short(exc)}"
+            result.error_code = "CONFIG"
             self._discard_session()
             binding.record(question, "", error=result.error)
             self.store.save(binding)
@@ -315,6 +372,20 @@ class AdvisorService:
             retry_parts.append("## 问题\n" + question)
             outcome = session.ask("\n\n".join(retry_parts), thread_id=thread_id, timeout=self.timeout)
 
+        # A turn can finish on Codex's side *after* we stopped waiting (timeout or
+        # watchdog). DSH hit exactly this: the answer existed but never reached the
+        # store. So before reporting failure, ask the source of truth.
+        if not outcome.ok and _is_timeout_like(outcome.error):
+            recovered_text, recovered_turn = self._recover_after_timeout(session, thread_id, outcome)
+            if recovered_text:
+                outcome = TurnOutcome(
+                    ok=True, text=recovered_text, thread_id=thread_id,
+                    turn_id=recovered_turn or outcome.turn_id, elapsed=outcome.elapsed,
+                    declined_approvals=outcome.declined_approvals,
+                )
+                result.error_code = "TIMEOUT_RECOVERED"
+                result.notes.append("本轮在本地超时/被判 wedged，但 Codex 侧已完成；已从 thread/turns/list 回收答案。")
+
         result.elapsed = outcome.elapsed
         result.turn_id = outcome.turn_id
         result.declined_approvals = outcome.declined_approvals
@@ -322,12 +393,97 @@ class AdvisorService:
         result.answer = outcome.text
         if not outcome.ok:
             result.error = outcome.error or "未知失败"
+            if not result.error_code:
+                result.error_code = (
+                    "TIMEOUT" if _is_timeout_like(result.error)
+                    else "TRANSPORT" if self._is_transport_failure(result.error)
+                    else "UNKNOWN"
+                )
 
         # 5) persist (success and failure both — the digest must reflect reality)
         binding.record(question, result.answer, turn_id=outcome.turn_id, error=result.error)
         binding.thread_id = thread_id
         self.store.save(binding)
         return result
+
+    def quota(self, *, lock_held: bool = False) -> dict[str, Any]:
+        """Quota snapshot via the control plane — **no tokens, no turn**.
+
+        Returns a compact, always-safe shape: never raises, since "quota unknown" must not
+        block an otherwise healthy advisor.
+
+        ``lock_held=True`` when the caller already holds the turn lock (``_ask_locked``
+        pre-flight). Acquiring a non-reentrant lock twice there deadlocked every ask for
+        ``busy_wait`` seconds and silently disabled the quota check — caught by the
+        quota test, kept honest by ``test_quota_preflight_does_not_deadlock``.
+        """
+        out: dict[str, Any] = {"ok": False, "source": f"codex-advisor/{PLUGIN_VERSION}"}
+        now = time.monotonic()
+        if self._quota_cache and now - self._quota_cache[0] < self.quota_ttl:
+            return dict(self._quota_cache[1], cached=True)
+        if now < self._quota_fail_until:
+            out["reason"] = "额度读取此前失败，冷却中（不影响提问）"
+            return out
+        if lock_held:
+            return self._read_quota_into(out, release=False)
+        if not self._lock.acquire(timeout=self.busy_wait):
+            out["reason"] = "顾问正忙，未探测额度"
+            return out
+        try:
+            return self._read_quota_into(out, release=False)
+        finally:
+            self._lock.release()
+
+    def _read_quota_into(self, out: dict[str, Any], *, release: bool) -> dict[str, Any]:
+        raw: dict[str, Any] = {}
+        last_error = ""
+        session = None
+        for attempt in (1, 2):
+            try:
+                session = session or self._get_session()
+                raw = session.rate_limits()
+                last_error = ""
+                break
+            except Exception as exc:
+                last_error = _short(exc)
+                logger.info("advisor: quota read attempt %d failed: %s", attempt, last_error)
+        if last_error:
+            out["reason"] = f"额度读取失败：{last_error}"
+            self._quota_fail_until = time.monotonic() + self.quota_backoff
+            return out
+
+        limits = raw.get("rateLimits") or {}
+        def _window(name: str) -> dict[str, Any]:
+            w = limits.get(name) or {}
+            return {
+                "used_percent": w.get("usedPercent"),
+                "window_minutes": w.get("windowDurationMins"),
+                "resets_at": w.get("resetsAt"),
+            }
+        out.update(
+            ok=True,
+            allowed=bool(raw.get("ordinaryUsageAllowed")),
+            plan=limits.get("planType"),
+            primary=_window("primary"),
+            secondary=_window("secondary"),
+            credits=(limits.get("credits") or {}).get("balance"),
+        )
+        self._quota_cache = (time.monotonic(), dict(out))
+        self._quota_fail_until = 0.0
+        return out
+
+    @staticmethod
+    def _quota_blocks(quota: dict[str, Any]) -> str:
+        """Human-readable reason when the quota says a turn cannot run."""
+        if quota.get("ok") and quota.get("allowed") is False:
+            sec = quota.get("secondary") or {}
+            reset = sec.get("resets_at")
+            when = ""
+            if isinstance(reset, (int, float)):
+                import datetime as _dt
+                when = _dt.datetime.fromtimestamp(reset).astimezone().isoformat(timespec="minutes")
+            return f"Codex 额度已耗尽（周窗 {sec.get('used_percent')}% 已用，重置 {when or '未知'}）"
+        return ""
 
     def probe(self, session_key: str) -> dict[str, Any]:
         """Check whether the bound Codex thread still exists — **without spending tokens**.
@@ -367,6 +523,77 @@ class AdvisorService:
             if not payload["thread_ok"]:
                 payload["reason"] = "线程已不存在（下个问题会新建线程并用 digest 续接）"
             return payload
+        finally:
+            self._lock.release()
+
+    def history(self, session_key: str, *, limit: int = 5, max_chars: int = 800) -> dict[str, Any]:
+        """The thread as **Codex** has it, next to what we recorded locally.
+
+        Two different truths live here: our digest (what we told the next thread) and the
+        real thread (what Codex still holds). When they disagree, the caller deserves to
+        know, because "the advisor remembers" is only true if the thread says so.
+        """
+        binding = self.store.get(session_key)
+        out: dict[str, Any] = {
+            "ok": True,
+            "source": f"codex-advisor/{PLUGIN_VERSION} · control-plane read (no tokens)",
+            "session_key": session_key,
+            "thread_id": binding.thread_id,
+            "local_turns": len(binding.turns),
+        }
+        if not binding.thread_id:
+            out.update(thread_ok=False, reason="该会话还没有绑定线程")
+            return out
+        if not self._lock.acquire(timeout=self.busy_wait):
+            out.update(ok=False, error_code="BUSY", reason="顾问正忙，暂时读不到历史")
+            return out
+        try:
+            session = self._get_session()
+            try:
+                turns = session.thread_turns(binding.thread_id)
+            except Exception as exc:
+                out.update(ok=False, error_code="TRANSPORT", reason=f"读取历史失败：{_short(exc)}")
+                return out
+            views: list[dict[str, Any]] = []
+            for turn in turns[-limit:]:
+                question = ""
+                for item in turn.get("items") or []:
+                    if item.get("type") == "userMessage":
+                        text = item.get("text") or "".join(
+                            p.get("text") or "" for p in (item.get("content") or []) if isinstance(p, dict)
+                        )
+                        question = str(text or "")
+                        break
+                answer = session.turn_agent_text(turn)
+                views.append(
+                    {
+                        "turn_id": turn.get("id"),
+                        "status": turn.get("status"),
+                        # Codex may return a structured error object here, not a string.
+                        "error": _error_text(turn.get("error"))[:200],
+                        "duration_seconds": round((turn.get("durationMs") or 0) / 1000, 1),
+                        "question": _clip(question, max_chars),
+                        "answer": _clip(answer, max_chars),
+                    }
+                )
+            local_n, remote_n = len(binding.turns), len(turns)
+            if remote_n == local_n:
+                verdict = "consistent"
+            elif remote_n > local_n:
+                # Expected: the digest keeps only the last `digest_turns` exchanges.
+                verdict = f"trimmed（本地保留最近 {local_n} 轮，Codex 有 {remote_n} 轮）"
+            else:
+                # The alarming direction: Codex holds fewer turns than we recorded.
+                verdict = f"drift（Codex 只有 {remote_n} 轮，少于本地记录的 {local_n} 轮）"
+            out.update(
+                thread_ok=True,
+                remote_turns=remote_n,
+                local_vs_remote=verdict,
+                local_trimmed=remote_n > local_n,
+                local_ahead=local_n > remote_n,
+                turns=views,
+            )
+            return out
         finally:
             self._lock.release()
 
@@ -427,12 +654,38 @@ class AdvisorService:
         }
 
 
+def _is_timeout_like(error: str) -> bool:
+    markers = ("超时", "无响应", "wedged", "timeout", "timed out")
+    return any(m in (error or "").lower() for m in markers)
+
+
 def _iso(ts: float) -> str:
     if not ts:
         return ""
     import datetime as _dt
 
     return _dt.datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+
+
+def _error_text(value: Any) -> str:
+    """Coerce Codex's error field (str | dict | None) into a readable string."""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return value
+    try:
+        import json as _json
+
+        return _json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _clip(text: str, limit: int) -> str:
+    text = (text or "").strip()
+    if limit and len(text) > limit:
+        return text[: max(0, limit - 20)].rstrip() + " …（截断）"
+    return text
 
 
 def _short(exc: BaseException, limit: int = 300) -> str:

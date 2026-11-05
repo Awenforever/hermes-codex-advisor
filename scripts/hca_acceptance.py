@@ -348,6 +348,29 @@ def check_l4(report: Report) -> None:
 
     check_probe(report)
 
+    # quota + history: both are control-plane reads, both usable during a quota drought
+    svc = _service(timeout=60)
+    try:
+        q = svc.quota()
+        if q.get("ok"):
+            report.add(Check("L4", "quota readable (0 tokens)", "PASS",
+                             f"5h {q.get('primary', {}).get('used_percent')}% / "
+                             f"weekly {q.get('secondary', {}).get('used_percent')}% / allowed={q.get('allowed')}", 0.0))
+        else:
+            report.add(Check("L4", "quota readable (0 tokens)", "BLOCKED", (q.get("reason") or "")[:160], 0.0))
+
+        h = svc.history("acceptance:L3")
+        if h.get("thread_ok"):
+            report.add(Check("L4", "history readable (0 tokens)", "PASS",
+                             f"remote_turns={h.get('remote_turns')} {h.get('local_vs_remote')}", 0.0))
+        elif h.get("ok") and not h.get("thread_ok"):
+            report.add(Check("L4", "history readable (0 tokens)", "PASS",
+                             f"explicit when unbound: {h.get('reason')}", 0.0))
+        else:
+            report.add(Check("L4", "history readable (0 tokens)", "FAIL", (h.get("reason") or "")[:160], 0.0))
+    finally:
+        svc.close()
+
     # 3) wedged app-server: 1s of silence must be judged a hang, not slowness
     svc = _service(timeout=60, idle_timeout_seconds=1)
     try:

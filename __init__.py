@@ -31,6 +31,7 @@ from .advisor.config import effective_config
 from .advisor.service import AdvisorService, build_service
 from .advisor.tools import (
     CODEX_ASK_SCHEMA,
+    CODEX_HISTORY_SCHEMA,
     CODEX_NEW_SCHEMA,
     CODEX_STATUS_SCHEMA,
     TOOLSET,
@@ -125,14 +126,33 @@ def register(ctx) -> None:  # noqa: D401 - plugin entrypoint
             )
         if lowered in {"probe", "探测"}:
             return json.dumps(svc.probe(key), ensure_ascii=False)
+        if lowered in {"quota", "额度"}:
+            return json.dumps(svc.quota(), ensure_ascii=False)
+        if lowered.startswith("history") or lowered.startswith("历史"):
+            parts = text.split()
+            limit = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 5
+            return json.dumps(svc.history(key, limit=limit), ensure_ascii=False)
         if lowered.startswith("new") or lowered.startswith("reset"):
             reason = text.split(maxsplit=1)[1] if len(text.split(maxsplit=1)) > 1 else "via /advisor new"
             return json.dumps(svc.reset(key, reason=reason), ensure_ascii=False)
         if lowered in {"help", "?", "/?"}:
-            return "用法：/advisor <问题> | /advisor status | /advisor probe | /advisor new [原因]"
+            return (
+                "用法：/advisor <问题> | /advisor status | /advisor probe | /advisor quota | "
+                "/advisor history [N] | /advisor new [原因]"
+            )
 
         result = svc.ask(key, text)
         return result.to_payload(max_chars=svc.max_answer_chars)["answer"] or result.error
+
+    ctx.register_tool(
+        name="codex_history",
+        toolset=TOOLSET,
+        schema=CODEX_HISTORY_SCHEMA,
+        handler=handlers["codex_history"],
+        is_async=True,
+        description="读顾问线程在 Codex 侧的真实历史（零 token）",
+        emoji="📜",
+    )
 
     ctx.register_command(
         name="advisor",

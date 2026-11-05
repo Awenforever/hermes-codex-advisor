@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.4.0 — 2026-11-05
+
+从 DSH 的 `dsh-codex-advisor`（E1–E32，0.5.3）对照后采纳的四条。全部有真机证据，不是照抄。
+
+### Added
+- **`codex_quota` 能力（走 `codex_status(probe=true)` 与 `/advisor quota`）**：直接读 Codex 的 `account/rateLimits/read`，**零 token** 拿到 5h 窗 / 周窗用量、重置时刻、plan。60s 缓存 + 失败后 120s 冷却——额度读不到是"未知"，不是"阻断"，绝不因为一次网络抖动把提问卡住。
+- **`codex_ask` 额度预检**：额度真的耗尽时**不发请求、不烧 token**，直接返回 `error_code=QUOTA_EXHAUSTED` 和重置时间。
+- **`codex_history`（第 4 个工具）**：读 **Codex 侧的真实历史**（`thread/turns/list`），并和本地 digest 对账，给出 `consistent` / `drift（本地 N 轮，Codex M 轮）`。"顾问记得"只有线程说了算。
+- **超时补捞**：本地超时或判 wedged 之后，先回头问源真相——若该 turn 在 Codex 侧已完成，直接回收答案并标 `error_code=TIMEOUT_RECOVERED`。对应 DSH 的 E31（ask-timeout 后 completion 不落库）。
+- **结构化错误码**：`QUOTA_EXHAUSTED` / `BUSY` / `TRANSPORT` / `TIMEOUT` / `TIMEOUT_RECOVERED` / `CONFIG` / `UNKNOWN`，调用方不必解析自然语言。
+- **`source` 带版本与档位**：`codex-advisor/0.4.0 · gpt-6-luna · max`（失败结果同样带）。
+- **GitHub Actions CI**：三档 Python 跑 47 项离线测试，**故意不安装 Hermes**——证明插件在没有宿主的裸 runner 上也能测。
+
+### Fixed
+- **额度预检自我死锁**：`_ask_locked` 已持轮次锁，预检又去 acquire 同一把非重入锁 → 每次 `ask` 白等 `busy_wait`（5s）且预检静默失效（整套测试从 5s 涨到 150s 才暴露）。改为 `lock_held=True` 直读，并加时间上界回归测试。
+
+
 ## 0.3.0 — 2026-11-05
 
 ### Added

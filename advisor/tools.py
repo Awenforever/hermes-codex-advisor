@@ -82,6 +82,29 @@ CODEX_NEW_SCHEMA: dict[str, Any] = {
 }
 
 
+CODEX_HISTORY_SCHEMA: dict[str, Any] = {
+    "name": "codex_history",
+    "description": (
+        "读取顾问线程在 **Codex 侧的真实历史**（不是我的本地摘要）：每轮的提问、回答、状态、错误。\n"
+        "用途：① 核对顾问到底记得什么；② 审计某轮失败的真实原因；③ 本地超时但服务端已完成时取回答案。\n"
+        "零 token（控制面调用）。"
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "turns": {
+                "type": "integer",
+                "description": "可选：只看最近 N 轮（默认 5）。",
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": "可选：回答正文的字符上限（默认 800/轮），避免把长回答灌进上下文。",
+            },
+        },
+    },
+}
+
+
 def _session_key(kwargs: dict[str, Any]) -> str:
     """Stable binding key for the current Hermes conversation."""
     for key in ("session_id", "parent_session_id"):
@@ -113,10 +136,24 @@ def make_handlers(get_service: Callable[[], Any]) -> dict[str, Callable[..., Any
         service = get_service()
         payload = service.status(key)
         if (args or {}).get("probe"):
-            probe = await asyncio.to_thread(service.probe, key)
+            probe, quota = await asyncio.gather(
+                asyncio.to_thread(service.probe, key),
+                asyncio.to_thread(service.quota),
+            )
             payload["probe"] = probe
+            payload["quota"] = quota
             if not probe.get("thread_ok"):
                 payload["warning"] = probe.get("reason") or "绑定线程不可用"
+            if quota.get("ok") and quota.get("allowed") is False:
+                payload["warning"] = "Codex 额度已耗尽，下一次提问会直接返回 QUOTA_EXHAUSTED"
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def codex_history(args: dict[str, Any], **kwargs: Any) -> str:
+        key = _session_key(kwargs)
+        service = get_service()
+        limit = int((args or {}).get("turns") or 5)
+        max_chars = int((args or {}).get("max_chars") or 800)
+        payload = await asyncio.to_thread(service.history, key, limit=limit, max_chars=max_chars)
         return json.dumps(payload, ensure_ascii=False)
 
     async def codex_new(args: dict[str, Any], **kwargs: Any) -> str:
@@ -129,4 +166,5 @@ def make_handlers(get_service: Callable[[], Any]) -> dict[str, Callable[..., Any
         "codex_ask": codex_ask,
         "codex_status": codex_status,
         "codex_new": codex_new,
+        "codex_history": codex_history,
     }

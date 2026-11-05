@@ -32,6 +32,17 @@ class FakeSession:
         self.error = error
         self.fail_first_with = fail_first_with
         self.dead_reason = ""
+        # control-plane defaults: quota fine, no remote turns unless a test sets them
+        self.rate_limit_payload: dict = {
+            "ordinaryUsageAllowed": True,
+            "rateLimits": {
+                "planType": "plus",
+                "primary": {"usedPercent": 10, "windowDurationMins": 300, "resetsAt": 1793882984},
+                "secondary": {"usedPercent": 20, "windowDurationMins": 10080, "resetsAt": 1794379479},
+                "credits": {"balance": "0"},
+            },
+        }
+        self.remote_turns: list[dict] = []
         self._alive = True
         self.messages: list[str] = []
         self.thread_ids_used: list[str] = []
@@ -49,6 +60,17 @@ class FakeSession:
     def mark_dead(self, reason: str) -> None:
         self.dead_reason = reason
         self._alive = False
+
+    def rate_limits(self) -> dict:
+        return self.rate_limit_payload
+
+    def thread_turns(self, thread_id: str, *, limit: int = 0) -> list[dict]:
+        return list(self.remote_turns)
+
+    @staticmethod
+    def turn_agent_text(turn: dict) -> str:
+        chunks = [i.get("text") or "" for i in (turn.get("items") or []) if i.get("type") == "agentMessage"]
+        return "\n".join(c for c in chunks if c).strip()
 
     def ensure_thread(self, thread_id: Optional[str]) -> tuple[str, bool]:
         if thread_id and self.resume_ok:
@@ -376,6 +398,183 @@ class SessionThreadTests(unittest.TestCase):
         self.assertEqual(methods.count("thread/start"), 0, "an existing thread must never be re-started")
         turn_calls = [c for c in client.calls if c[0] == "turn/start"]
         self.assertEqual([c[1]["threadId"] for c in turn_calls], ["t-live", "t-live"])
+
+
+class QuotaAndRecoveryTests(unittest.TestCase):
+    """Learned from DSH: check quota before burning a turn; recover completions we missed."""
+
+    def test_quota_exhausted_blocks_before_any_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            sess.rate_limit_payload["ordinaryUsageAllowed"] = False
+            sess.rate_limit_payload["rateLimits"]["secondary"]["usedPercent"] = 100
+            svc = build(tmp, sess)
+            res = svc.ask("session:A", "问一句")
+            self.assertFalse(res.ok)
+            self.assertEqual(res.error_code, "QUOTA_EXHAUSTED")
+            self.assertIn("额度已耗尽", res.error)
+            self.assertIn("周窗", res.error)
+            self.assertEqual(sess.messages, [], "a doomed turn must not be sent")
+            self.assertTrue(res.quota, "payload should carry the quota snapshot")
+
+    def test_quota_preflight_does_not_deadlock_on_the_turn_lock(self) -> None:
+        """Regression: the pre-flight ran under the lock and re-acquired it (5s each)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = build(tmp, FakeSession(), busy_wait_seconds=5)
+            start = time.monotonic()
+            svc.ask("session:A", "问一句")
+            elapsed = time.monotonic() - start
+            self.assertLess(elapsed, 1.0, f"ask took {elapsed:.1f}s — the quota pre-flight is deadlocking")
+
+    def test_quota_snapshot_is_readable_without_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = build(tmp, FakeSession())
+            q = svc.quota()
+            self.assertTrue(q["ok"])
+            self.assertTrue(q["allowed"])
+            self.assertEqual(q["secondary"]["used_percent"], 20)
+            self.assertEqual(q["plan"], "plus")
+
+    def test_timeout_whose_turn_actually_completed_is_recovered(self) -> None:
+        """DSH's E31 lesson: the answer can land on the server after we stop waiting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession(error="超时：60s 内未收到 turn/completed")
+            sess.remote_turns = [
+                {"id": "turn-1", "status": "completed",
+                 "items": [{"type": "agentMessage", "text": "服务端其实答完了"}]},
+            ]
+            svc = build(tmp, sess)
+            res = svc.ask("session:A", "问一句")
+            self.assertTrue(res.ok, res.error)
+            self.assertEqual(res.answer, "服务端其实答完了")
+            self.assertEqual(res.error_code, "TIMEOUT_RECOVERED")
+            self.assertIn("回收答案", " ".join(res.notes))
+
+    def test_timeout_that_really_failed_is_not_faked(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession(error="超时：60s 内未收到 turn/completed")
+            sess.remote_turns = [{"id": "turn-1", "status": "failed", "error": "boom", "items": []}]
+            svc = build(tmp, sess)
+            res = svc.ask("session:A", "问一句")
+            self.assertFalse(res.ok)
+            self.assertEqual(res.error_code, "TIMEOUT")
+
+    def test_payload_source_carries_version_model_effort(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = build(tmp, FakeSession())
+            src = svc.ask("session:A", "问一句").to_payload()["source"]
+            self.assertIn("codex-advisor/0.4.0", src)
+            self.assertIn("gpt-6-luna", src)
+            self.assertIn("max", src)
+
+    def test_history_shows_remote_turns_and_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess)
+            svc.ask("session:A", "问一句")          # local: 1 turn
+            sess.remote_turns = [
+                {"id": "t1", "status": "completed", "durationMs": 1200,
+                 "items": [{"type": "userMessage", "content": [{"type": "text", "text": "问一句"}]},
+                           {"type": "agentMessage", "text": "答一"}]},
+                {"id": "t2", "status": "completed", "durationMs": 800,
+                 "items": [{"type": "agentMessage", "text": "答二"}]},
+            ]
+            out = svc.history("session:A")
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["remote_turns"], 2)
+            # 1 local turn vs 2 remote: the digest's retention limit, not data loss
+            self.assertIn("trimmed", out["local_vs_remote"])
+            self.assertTrue(out["local_trimmed"])
+            self.assertFalse(out["local_ahead"])
+            self.assertEqual(out["turns"][-1]["answer"], "答二")
+            self.assertEqual(out["turns"][0]["question"], "问一句")
+
+    def test_history_flags_the_alarming_direction(self) -> None:
+        """Codex holding fewer turns than we recorded is real context loss."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess)
+            svc.ask("session:A", "问一")
+            svc.ask("session:A", "问二")
+            sess.remote_turns = [{"id": "t1", "status": "completed", "items": []}]
+            out = svc.history("session:A")
+            self.assertIn("drift", out["local_vs_remote"])
+            self.assertTrue(out["local_ahead"])
+
+    def test_history_handles_structured_turn_errors(self) -> None:
+        """Codex returns `error` as an object on failed turns; slicing it must not crash."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess)
+            svc.ask("session:A", "问一句")
+            sess.remote_turns = [
+                {"id": "t1", "status": "failed",
+                 "error": {"message": "workspace routing discovery failed", "code": "ROUTING"},
+                 "items": []},
+            ]
+            out = svc.history("session:A")
+            self.assertTrue(out["ok"])
+            self.assertIn("workspace routing", out["turns"][0]["error"])
+
+    def test_history_without_binding_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = build(tmp, FakeSession()).history("session:none")
+            self.assertTrue(out["ok"])
+            self.assertFalse(out["thread_ok"])
+            self.assertIn("没有绑定线程", out["reason"])
+
+
+class QuotaCacheTests(unittest.TestCase):
+    """A nice-to-have pre-flight must never become a latency tax."""
+
+    def test_snapshot_is_cached(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            calls = {"n": 0}
+            real = sess.rate_limits
+
+            def counting():
+                calls["n"] += 1
+                return real()
+
+            sess.rate_limits = counting
+            svc = build(tmp, sess)
+            svc.quota()
+            second = svc.quota()
+            self.assertEqual(calls["n"], 1, "second read should come from cache")
+            self.assertTrue(second.get("cached"))
+
+    def test_failure_backs_off_instead_of_retrying_every_ask(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            calls = {"n": 0}
+
+            def boom():
+                calls["n"] += 1
+                raise RuntimeError("error sending request")
+
+            sess.rate_limits = boom
+            svc = build(tmp, sess)
+            first = svc.quota()
+            self.assertFalse(first["ok"])
+            self.assertIn("额度读取失败", first["reason"])
+            attempts_after_first = calls["n"]
+            second = svc.quota()
+            self.assertFalse(second["ok"])
+            self.assertIn("冷却", second["reason"])
+            self.assertEqual(calls["n"], attempts_after_first, "backoff must stop repeat attempts")
+
+    def test_unknown_quota_never_blocks_a_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+
+            def boom():
+                raise RuntimeError("no network")
+
+            sess.rate_limits = boom
+            svc = build(tmp, sess)
+            res = svc.ask("session:A", "问一句")
+            self.assertTrue(res.ok, "quota is advisory: unknown must not block a healthy advisor")
 
 
 class SessionIsolationTests(unittest.TestCase):

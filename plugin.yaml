@@ -1,5 +1,5 @@
 name: hermes-codex-advisor
-version: 0.3.0
+version: 0.4.0
 manifest_version: 1
 api_version: 1
 description: Persistent Codex advisor for Hermes — one durable thread per session, ask/judge/verify, survives restarts.
@@ -13,6 +13,7 @@ provides_tools:
   - codex_ask
   - codex_status
   - codex_new
+  - codex_history
 provides_commands:
   - advisor
 

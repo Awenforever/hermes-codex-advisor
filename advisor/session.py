@@ -336,6 +336,45 @@ class AdvisorSession:
             outcome.ok = False
         return outcome
 
+    # -- control-plane reads (no tokens, no turn) -------------------------
+    def rate_limits(self, timeout: float = 10.0) -> dict[str, Any]:
+        """Quota snapshot straight from Codex. Control-plane call: no tokens.
+
+        Knowing this *before* a turn turns "some error string mentioned usage limit" into
+        "the weekly window is at 86% and resets at T" — and lets the caller skip a doomed
+        turn entirely.
+        """
+        client = self._ensure_client()
+        res = client.request("account/rateLimits/read", {}, timeout=timeout)
+        return res if isinstance(res, dict) else {}
+
+    def thread_turns(self, thread_id: str, *, limit: int = 0) -> list[dict[str, Any]]:
+        """The thread as Codex sees it — used to verify our digest and to recover answers."""
+        client = self._ensure_client()
+        params: dict[str, Any] = {"threadId": thread_id}
+        if limit:
+            params["limit"] = limit
+        res = client.request("thread/turns/list", params, timeout=25)
+        if not isinstance(res, dict):
+            return []
+        turns = res.get("data")
+        return [t for t in (turns or []) if isinstance(t, dict)]
+
+    @staticmethod
+    def turn_agent_text(turn: dict[str, Any]) -> str:
+        """Flatten one turn's agent messages into text."""
+        chunks: list[str] = []
+        for item in turn.get("items") or []:
+            if item.get("type") != "agentMessage":
+                continue
+            text = item.get("text")
+            if not text:
+                parts = [p.get("text") or "" for p in (item.get("content") or []) if isinstance(p, dict)]
+                text = "".join(parts)
+            if text:
+                chunks.append(str(text))
+        return "\n".join(chunks).strip()
+
     def interrupt(self) -> None:
         if self._client is None:
             return

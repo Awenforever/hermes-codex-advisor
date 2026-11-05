@@ -1,0 +1,28 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: offline contract tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Deliberately no Hermes install: the plugin must stay testable standalone.
+      # Its only host dependency (agent.transports) is imported lazily and falls back to
+      # the built-in minimal projector, so these 47 tests run on a bare runner.
+      - name: unittest
+        run: PYTHONPATH="$PWD" python -m unittest discover -s tests -t . -v

@@ -73,6 +73,20 @@ Hermes agent
 | E# 证据表 + 发布验收分级 | 下一阶段（M3）落地到协作中心项目页 |
 | 不覆盖旧日志、用 Supersedes | 协作中心 LOG 遵守 |
 
+## 6.5 二轮对照 DSH（2026-11-05，DSH 已走到 0.5.3 / E1–E32）
+
+第一轮只学了骨架；第二轮对着它的证据表逐条比，采纳了四条，放弃了两条。
+
+| DSH 的做法 | 我们的判断 | 落地 |
+|---|---|---|
+| `codex_history` 读真实历史 | **采纳**。本地 digest 是"我告诉下一轮什么"，不等于"线程里真有什么" | `codex_history` 工具 + `/advisor history N`；与本地对账，`consistent` / `trimmed` / `drift` |
+| 额度快照（`account/rateLimits/read`） | **采纳**，比它更进一步：拿来做**提问前置检查**，额度真耗尽时不发请求 | `codex_status(probe)` / `/advisor quota`；`QUOTA_EXHAUSTED` 精确到重置时刻 |
+| 失败结果也带结构化信息（`source`、`last_failure.code`） | **采纳**，扩成通用错误码 | 7 个 `error_code`；`source` 带版本+模型+档位，失败同样带 |
+| ask 超时后 completion 不落库（它的 E31） | **采纳反面教训**。我们的做法不是"补写库"，而是**回头问源真相**：超时后读 `thread/turns/list`，该轮真完成就回收答案 | `TIMEOUT_RECOVERED` |
+| GitHub Actions CI | **采纳**，并且更严：**故意不安装 Hermes**，证明插件在裸 runner 上也能测（投影器有内置最小实现兜底） | `.github/workflows/ci.yml`，三档 Python |
+| 6 工具 + `codex_poll` / `codex_cancel` 异步模型 | **暂不采纳**。它的 ask 是异步的（返回句柄、轮询、可取消），因为桌面 UI 需要非阻塞。我们是 agent 工具，天然同步；实测正常问答 3–18s，异步化会把复杂度推给调用方 | 记为长期选项 |
+| 侧栏卡片 / tab / 更新红点（L2 UI） | **不适用**。那是 desktop 插件的宿主 UI；Hermes 插件没有 UI 插槽 | — |
+
 ## 7. 里程碑
 
 - **M0（已完成）** 骨架 + 3 工具注册 + 11 项离线契约测试 + `plugins doctor` 全绿
