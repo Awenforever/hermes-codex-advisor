@@ -525,6 +525,48 @@ class ResilienceTests(unittest.TestCase):
             self.assertIn("更早的问题", retry_msg)   # digest replayed into the fresh thread
             self.assertIn("新问题", retry_msg)
 
+    def test_transient_routing_failure_is_retried_once(self) -> None:
+        """Codex's workspace routing call fails intermittently; one retry must cover it."""
+        from advisor.service import AdvisorService as _Svc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            made: list[FakeSession] = []
+
+            def factory(**kw):
+                first = not made
+                s = FakeSession(fail_first_with="turn status=failed: workspace routing discovery failed"
+                                if first else "")
+                made.append(s)
+                return s
+
+            svc = _Svc(store=StateStore(os.path.join(tmp, "state.json")), session_factory=factory,
+                       model="gpt-6-luna", effort="max", sandbox="read-only",
+                       codex_bin="/bin/true", codex_home=tmp, cwd=None,
+                       timeout=5, digest_turns=6, max_answer_chars=12000)
+            res = svc.ask("session:A", "问一句")
+            self.assertTrue(res.ok, res.error)
+            self.assertTrue(res.recovered)
+            self.assertEqual(len(made), 2)
+
+    def test_persistent_routing_failure_still_reports_honestly(self) -> None:
+        from advisor.service import AdvisorService as _Svc
+
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = {"n": 0}
+
+            def factory(**kw):
+                calls["n"] += 1
+                return FakeSession(fail_first_with="", error="turn status=failed: workspace routing discovery failed")
+
+            svc = _Svc(store=StateStore(os.path.join(tmp, "state.json")), session_factory=factory,
+                       model="gpt-6-luna", effort="max", sandbox="read-only",
+                       codex_bin="/bin/true", codex_home=tmp, cwd=None,
+                       timeout=5, digest_turns=6, max_answer_chars=12000)
+            res = svc.ask("session:A", "问一句")
+            self.assertFalse(res.ok)
+            self.assertIn("workspace routing", res.error)
+            self.assertLessEqual(calls["n"], 2, "retry must stay bounded to one attempt")
+
     def test_health_declines_with_failures_and_recovers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sess = FakeSession(error="turn status=failed: usage limit exceeded")

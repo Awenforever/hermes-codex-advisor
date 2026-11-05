@@ -209,12 +209,22 @@ class AdvisorService:
 
     @staticmethod
     def _is_transport_failure(error: str) -> bool:
-        """Transport-level failure (process/wire), as opposed to a model-level error."""
+        """Transport-level failure (process/wire/routing), as opposed to a model-level error.
+
+        ``workspace routing discovery failed`` belongs here: Codex reaches a ChatGPT-side
+        routing service before a turn starts, and that call fails intermittently (observed
+        once at 16:11, gone on retry). Treating it as a model-level failure meant the
+        advisor gave up on a question that a single retry answers — the retry is fenced
+        behind the same once-only guard as every other transport failure, so a persistent
+        outage still surfaces honestly and cheaply.
+        """
         markers = (
             "app-server", "已失联", "无响应", "进程已退出",
             "turn/start 失败", "无法建立 codex 线程", "resume 失败",
+            "workspace routing", "routing discovery", "connection reset",
+            "ECONNRESET", "ETIMEDOUT", "network is unreachable",
         )
-        return any(m in (error or "") for m in markers)
+        return any(m.lower() in (error or "").lower() for m in markers)
 
     def _discard_session(self) -> None:
         if self._session is not None:

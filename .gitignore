@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+LOG.md
+state.json
+*.log
