@@ -93,3 +93,32 @@
 - 发布/推送：插件仓库（M2 提交）
 - 当前状态：M2 机制完成，成功路径的复验待额度
 - Residual：R4 关闭（并发已处理）；新增 R7 额度恢复后复验 M2-B/D；R3/R5/R6 不变
+
+### 2026-11-05 12:30–13:05 +0800 · M3：验收分级 L0–L4 + 文档工程化
+
+- 执行周期：from 2026-11-05 12:30 +0800 to 2026-11-05 13:05 +0800
+- 基线：`b5ce606`（M2）
+
+**做了什么**
+
+- **验收分级脚本** `scripts/hca_acceptance.py`（L0–L4），三态判定 PASS / FAIL / **BLOCKED**
+  - L0 可加载（编译 + `hermes plugins doctor` 无 WARN）｜L1 离线契约（25 项）｜L2 插件路径端到端（fake ctx → register → 真 handler → 真答）｜L3 连续性（两轮同线程 + 跨进程 resume）｜L4 韧性（并发拒绝 / 确定性失败如实 / 静默看门狗）
+  - BLOCKED 只认两种原因：Codex 额度耗尽、codex 二进制缺失。其余一律 FAIL——不许拿 BLOCKED 掩盖真失败
+  - 「最高通过等级」按**连续**计算：L3 过了但 L2 没过 → 报 L1
+- README（安装/用法/配置/不变量/验收/排障表）、CHANGELOG（0.1.0 / 0.2.0）、版本号 → 0.2.0
+
+**脚本自身踩的三个坑（都修了）**
+
+1. 用系统 `python3` 跑 → 插件导入 `agent.transports` 失败，报「No module named 'agent'」，看起来像插件坏了。真相：插件复用宿主传输层，必须在 Hermes venv 里跑。修法是脚本**自行 re-exec 到宿主解释器**，不是改插件
+2. 并发检查传了 `busy_wait`，而 `build_service` 读的是 `busy_wait_seconds` → 静默回落 5s 默认值，检查形同虚设（表现为「0.05s 应通过却等了 5s」）
+3. 「最高等级」原本取"有任意 PASS 的最高级" → L4 单项过了就敢报 L4。改成连续判定
+
+**验证**
+
+- `python3 scripts/hca_acceptance.py`（真机，额度耗尽状态）：L0 PASS / L1 PASS / L2、L3 **BLOCKED（quota）** / **L4 三项全 PASS**
+- L4 的「静默看门狗」这次**不用额度就验成了**：`idle_timeout=1s` 在配额消耗前触发，错误原文「app-server 无响应：连续 1s 没有事件（阈值 1s），已发中断并把该会话隔离」→ M2-B 的真机证据补上
+- `hermes plugins doctor` 版本升到 0.2.0 后仍无告警
+
+- 发布/推送：插件仓库 `75c0415`
+- 当前状态：M3 完成；L2/L3 待额度恢复后由 15:50 作业与下一次真机问答补
+- Residual：R5 关闭；R3（`/advisor` 参数路径）、R6（公开仓库）、R7（额度后复验 L2/L3）仍开
