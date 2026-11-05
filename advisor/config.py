@@ -34,6 +34,7 @@ SETTING_KEYS: dict[str, str] = {
     "advisor_busy_wait_seconds": "busy_wait_seconds",
     "advisor_retry_on_transport_failure": "retry_on_transport_failure",
     "advisor_digest_max_chars": "digest_max_chars",
+    "advisor_idle_shutdown_seconds": "idle_shutdown_seconds",
 }
 
 #: Values used when neither settings nor caller supply anything.
@@ -49,6 +50,7 @@ DEFAULTS: dict[str, Any] = {
     "busy_wait_seconds": 5,
     "retry_on_transport_failure": True,
     "digest_max_chars": 6000,
+    "idle_shutdown_seconds": 900,
     "state_path": "/opt/data/plugin-data/hermes-codex-advisor/state.json",
 }
 

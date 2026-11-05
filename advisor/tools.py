@@ -51,10 +51,20 @@ CODEX_ASK_SCHEMA: dict[str, Any] = {
 CODEX_STATUS_SCHEMA: dict[str, Any] = {
     "name": "codex_status",
     "description": (
-        "查看 Codex 顾问的当前状态：绑定的线程、模型/effort、最近一轮问答、"
-        "app-server 是否存活、状态文件路径。排查『顾问是不是挂了』时先看这个。"
+        "查看 Codex 顾问的当前状态：绑定的线程、模型/effort、健康度、最近一轮问答、"
+        "app-server 是否存活、状态文件路径。排查『顾问是不是挂了』时先看这个。\n"
+        "probe=true 时会真的去 Codex 确认绑定线程还在不在——控制面调用，**不消耗 token**，"
+        "额度紧张时也能用。"
     ),
-    "parameters": {"type": "object", "properties": {}},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "probe": {
+                "type": "boolean",
+                "description": "可选：true = 实际探测绑定线程是否仍存在（不消耗 token，约 1–3s，首次会拉起 app-server）。",
+            },
+        },
+    },
 }
 
 CODEX_NEW_SCHEMA: dict[str, Any] = {
@@ -101,7 +111,13 @@ def make_handlers(get_service: Callable[[], Any]) -> dict[str, Callable[..., Any
     async def codex_status(args: dict[str, Any], **kwargs: Any) -> str:
         key = _session_key(kwargs)
         service = get_service()
-        return json.dumps(service.status(key), ensure_ascii=False)
+        payload = service.status(key)
+        if (args or {}).get("probe"):
+            probe = await asyncio.to_thread(service.probe, key)
+            payload["probe"] = probe
+            if not probe.get("thread_ok"):
+                payload["warning"] = probe.get("reason") or "绑定线程不可用"
+        return json.dumps(payload, ensure_ascii=False)
 
     async def codex_new(args: dict[str, Any], **kwargs: Any) -> str:
         key = _session_key(kwargs)

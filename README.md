@@ -41,7 +41,7 @@ s6-svc -r /run/service/gateway-default     # 容器内；systemd 环境用 syste
 | 能力 | 说明 |
 |---|---|
 | `codex_ask(question, context?, fresh?)` | 在持久线程里问一句，阻塞到答完 |
-| `codex_status()` | 线程 / 模型 / 存活 / 健康度 / 最近一轮 |
+| `codex_status(probe?)` | 线程 / 模型 / 存活 / 健康度 / 最近一轮；`probe=true` 真去确认线程还在（**不耗 token**）|
 | `codex_new(reason?)` | 重置线程（旧问答仍作摘要保留） |
 | `/advisor <问题>` | 不走工具直接问 |
 
@@ -60,6 +60,8 @@ s6-svc -r /run/service/gateway-default     # 容器内；systemd 环境用 syste
 | `advisor_idle_timeout_seconds` | `90` | 连续无事件多久判 wedged |
 | `advisor_busy_wait_seconds` | `5` | 并发时最多等多久，超时直接回「顾问正忙」 |
 | `advisor_digest_turns` | `6` | 线程丢失时重放最近几轮问答 |
+| `advisor_digest_max_chars` | `6000` | digest 的字符预算（比轮数更可靠）|
+| `advisor_idle_shutdown_seconds` | `900` | 空闲多久关掉 app-server（线程在 Codex 侧保留）|
 | `advisor_retry_on_transport_failure` | `true` | 传输层失败是否隔离重启重试一次 |
 | `advisor_codex_binary` | `/opt/data/bin/codex` | |
 | `advisor_state_path` | `…/hermes-codex-advisor/state.json` | |

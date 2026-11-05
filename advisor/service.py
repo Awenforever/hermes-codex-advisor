@@ -105,6 +105,7 @@ class AdvisorService:
         idle_timeout: float = 90.0,
         busy_wait: float = 5.0,
         retry_on_transport_failure: bool = True,
+        idle_shutdown: float = 900.0,
     ) -> None:
         self.store = store
         self.model = model
@@ -117,6 +118,11 @@ class AdvisorService:
         self.idle_timeout = idle_timeout
         self.busy_wait = busy_wait
         self.retry_on_transport_failure = retry_on_transport_failure
+        # A codex app-server kept forever is a process and a set of handles nobody needs.
+        # After this long without a turn we close it; the bound thread survives in Codex,
+        # and the next question resumes it (cross-process resume is a proven path).
+        self.idle_shutdown = idle_shutdown
+        self._last_used = 0.0
         self.digest_turns = digest_turns
         self.digest_max_chars = digest_max_chars
         self.max_answer_chars = max_answer_chars
@@ -125,6 +131,28 @@ class AdvisorService:
         self._lock = threading.Lock()
 
     # -- session plumbing -------------------------------------------------
+    def _reap_if_idle(self, *, lock_held: bool) -> bool:
+        """Close an idle app-server. Returns True when something was reaped.
+
+        ``status()`` calls this without holding the turn lock, so it must never reap while
+        a turn is in flight — closing the app-server under a running turn would kill it.
+        Callers that already hold the lock pass ``lock_held=True``.
+        """
+        if self._session is None or not self.idle_shutdown:
+            return False
+        if not lock_held and not self._lock.acquire(blocking=False):
+            return False  # a turn is running; leave it alone
+        try:
+            idle_for = time.monotonic() - self._last_used if self._last_used else 0.0
+            if self._last_used and idle_for <= self.idle_shutdown:
+                return False
+            logger.info("advisor: closing idle app-server after %.0fs of no turns", idle_for)
+            self._discard_session()
+            return True
+        finally:
+            if not lock_held:
+                self._lock.release()
+
     def _get_session(self) -> AdvisorSession:
         if self._session is not None and self._session.alive():
             return self._session
@@ -173,8 +201,10 @@ class AdvisorService:
                 ),
             )
         try:
+            self._reap_if_idle(lock_held=True)
             return self._ask_locked(session_key, question, extra_context, fresh)
         finally:
+            self._last_used = time.monotonic()
             self._lock.release()
 
     @staticmethod
@@ -289,7 +319,49 @@ class AdvisorService:
         self.store.save(binding)
         return result
 
+    def probe(self, session_key: str) -> dict[str, Any]:
+        """Check whether the bound Codex thread still exists — **without spending tokens**.
+
+        ``thread/resume`` is a control-plane call: it either finds the thread or it doesn't.
+        That makes "is my advisor still holding my history?" answerable during a quota
+        drought, which is exactly when the question matters.
+        """
+        binding = self.store.get(session_key)
+        payload: dict[str, Any] = {
+            "ok": True,
+            "source": "codex-advisor",
+            "session_key": session_key,
+            "thread_id": binding.thread_id,
+        }
+        if not binding.thread_id:
+            payload.update(thread_ok=False, reason="该会话还没有绑定线程（首个问题会新建）")
+            return payload
+        if not self._lock.acquire(timeout=self.busy_wait):
+            payload.update(ok=False, thread_ok=False, reason="顾问正忙，无法探测（不影响已绑定线程）")
+            return payload
+        try:
+            started = time.monotonic()
+            session = self._get_session()
+            try:
+                thread_id, resumed = session.ensure_thread(binding.thread_id)
+            except Exception as exc:
+                payload.update(ok=False, thread_ok=False, reason=f"探测失败：{_short(exc)}")
+                return payload
+            payload.update(
+                thread_ok=bool(resumed and thread_id == binding.thread_id),
+                resumed=resumed,
+                app_server_alive=session.alive(),
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                cost="no tokens（thread/resume 是控制面调用，不进入对话）",
+            )
+            if not payload["thread_ok"]:
+                payload["reason"] = "线程已不存在（下个问题会新建线程并用 digest 续接）"
+            return payload
+        finally:
+            self._lock.release()
+
     def status(self, session_key: str) -> dict[str, Any]:
+        self._reap_if_idle(lock_held=False)
         binding: Binding = self.store.get(session_key)
         session = self._session
         alive = bool(session and session.alive())
@@ -314,6 +386,7 @@ class AdvisorService:
             "busy": self._lock.locked(),
             "timeout_seconds": self.timeout,
             "idle_timeout_seconds": self.idle_timeout,
+            "idle_shutdown_seconds": self.idle_shutdown,
             "state_path": str(self.store.path),
             "codex_bin": self.codex_bin,
             "codex_home": self.codex_home,
@@ -377,4 +450,5 @@ def build_service(config: dict[str, Any]) -> AdvisorService:
         idle_timeout=float(config.get("idle_timeout_seconds") or 90),
         busy_wait=float(config.get("busy_wait_seconds") or 5),
         retry_on_transport_failure=bool(config.get("retry_on_transport_failure", True)),
+        idle_shutdown=float(config.get("idle_shutdown_seconds") or 900),
     )

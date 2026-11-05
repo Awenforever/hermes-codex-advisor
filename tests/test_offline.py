@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 import unittest
 from typing import Any, Optional
 
@@ -89,6 +90,8 @@ def build(tmp: str, session: FakeSession, **overrides: Any) -> AdvisorService:
         codex_bin=cfg["codex_bin"], codex_home=cfg["codex_home"], cwd=cfg["cwd"],
         timeout=cfg["timeout"], digest_turns=cfg["digest_turns"],
         max_answer_chars=cfg["max_answer_chars"],
+        busy_wait=float(cfg.get("busy_wait_seconds") or 5),
+        idle_shutdown=float(cfg.get("idle_shutdown_seconds") or 900),
     )
 
 
@@ -373,6 +376,79 @@ class SessionThreadTests(unittest.TestCase):
         self.assertEqual(methods.count("thread/start"), 0, "an existing thread must never be re-started")
         turn_calls = [c for c in client.calls if c[0] == "turn/start"]
         self.assertEqual([c[1]["threadId"] for c in turn_calls], ["t-live", "t-live"])
+
+
+class ThreadProbeTests(unittest.TestCase):
+    """probe(): answer "is my history still there?" without spending tokens."""
+
+    def test_probe_reports_live_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess)
+            svc.ask("session:A", "问一句")           # binds a thread
+            out = svc.probe("session:A")
+            self.assertTrue(out["ok"])
+            self.assertTrue(out["thread_ok"])
+            self.assertEqual(out["thread_id"], sess.thread_id)
+            self.assertIn("no tokens", out["cost"])
+            self.assertEqual(len(sess.messages), 1, "probe must not run a turn")
+
+    def test_probe_reports_missing_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess)
+            svc.ask("session:A", "问一句")
+            sess.resume_ok = False
+            out = svc.probe("session:A")
+            self.assertFalse(out["thread_ok"])
+            self.assertIn("digest", out["reason"])
+
+    def test_probe_without_binding_is_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            svc = build(tmp, FakeSession())
+            out = svc.probe("session:none")
+            self.assertTrue(out["ok"])
+            self.assertFalse(out["thread_ok"])
+            self.assertIn("没有绑定线程", out["reason"])
+
+
+class IdleShutdownTests(unittest.TestCase):
+    """An app-server kept forever is a process nobody needs."""
+
+    def test_idle_session_is_closed_and_thread_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess, idle_shutdown_seconds=60)
+            svc.ask("session:A", "问一句")
+            self.assertIs(svc._session, sess)
+            svc._last_used = time.monotonic() - 120     # pretend two minutes of silence
+            st = svc.status("session:A")
+            self.assertIsNone(svc._session, "idle app-server should be closed")
+            self.assertTrue(st["has_thread"], "binding must survive reaping")
+            self.assertTrue(sess.closed)
+
+    def test_status_never_reaps_under_a_running_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess, idle_shutdown_seconds=1)
+            svc.ask("session:A", "问一句")
+            svc._last_used = time.monotonic() - 120        # would normally be reaped
+            self.assertTrue(svc._lock.acquire(timeout=1))   # simulate an in-flight turn
+            try:
+                svc.status("session:A")
+            finally:
+                svc._lock.release()
+            self.assertIs(svc._session, sess, "closing the app-server under a live turn would kill it")
+            self.assertFalse(sess.closed)
+
+    def test_recent_session_is_not_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sess = FakeSession()
+            svc = build(tmp, sess, idle_shutdown_seconds=600)
+            svc.ask("session:A", "问一句")
+            svc.status("session:A")
+            self.assertIs(svc._session, sess)
+            self.assertFalse(sess.closed)
 
 
 class ResilienceTests(unittest.TestCase):

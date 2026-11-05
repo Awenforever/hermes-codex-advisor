@@ -346,18 +346,65 @@ def check_l4(report: Report) -> None:
     finally:
         svc.close()
 
+    check_probe(report)
+
     # 3) wedged app-server: 1s of silence must be judged a hang, not slowness
     svc = _service(timeout=60, idle_timeout_seconds=1)
     try:
         res = svc.ask("acceptance:L4:hang", "一句话回答：2+2 等于几？")
         text = f"{res.error} {' '.join(res.notes)}"
-        if "无响应" in text:
-            report.add(Check("L4", "silent app-server judged dead", "PASS", text[:200], res.elapsed))
+        if "无响应" in (res.error or ""):
+            report.add(Check("L4", "silent app-server judged dead", "PASS",
+                             f"watchdog fired before any answer: {res.error[:150]}", res.elapsed))
+        elif "无响应" in text:
+            report.add(Check("L4", "silent app-server judged dead", "PASS",
+                             f"watchdog fired, then recovery hit a separate error: {res.error[:120]}", res.elapsed))
         elif _is_quota(text):
             report.add(Check("L4", "silent app-server judged dead", "BLOCKED",
                              f"quota exhausted before the watchdog could fire: {text[:150]}", res.elapsed))
         else:
             report.add(Check("L4", "silent app-server judged dead", "FAIL", text[:300], res.elapsed))
+    finally:
+        svc.close()
+
+
+def check_probe(report: Report) -> None:
+    """probe() must answer "is the history still there?" without spending tokens.
+
+    This is quota-free by construction: ``thread/resume`` is a control-plane call. It is
+    checked here (not in L2/L3) precisely because it stays usable during a quota drought —
+    which is when an operator most wants to know whether the advisor still has memory.
+    """
+    svc = _service(timeout=60)
+    try:
+        # 1) no binding -> explicit, not a crash
+        out = svc.probe("acceptance:no-such-session")
+        ok = out.get("ok") and out.get("thread_ok") is False and "没有绑定线程" in (out.get("reason") or "")
+        report.add(Check("L4", "probe is explicit when unbound", "PASS" if ok else "FAIL",
+                         (out.get("reason") or "")[:160], 0.0))
+
+        # 2) a thread bound by an earlier session -> real resume, still no tokens
+        bound = [
+            key for key, b in svc.store.all_bindings().items()
+            if b.thread_id and "acceptance:" not in key
+        ]
+        if not bound:
+            report.add(Check("L4", "probe resumes a real thread (0 tokens)", "BLOCKED",
+                             "no pre-existing binding on this host to probe"))
+            return
+        key = bound[0]
+        start = time.monotonic()
+        out = svc.probe(key)
+        secs = time.monotonic() - start
+        text = f"{out.get('thread_ok')} {out.get('reason') or out.get('cost') or ''}"
+        if out.get("thread_ok"):
+            status = "PASS"
+        elif _is_quota(text):
+            status = "BLOCKED"
+        else:
+            status = "FAIL"
+        report.add(Check("L4", "probe resumes a real thread (0 tokens)", status,
+                         f"{key[:28]}: {text[:120]}", secs))
     finally:
         svc.close()
 

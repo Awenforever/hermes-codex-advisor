@@ -92,6 +92,7 @@ class AdvisorSession:
         # A live child process can still be wedged (stdio open, nothing coming back).
         # Silence longer than this counts as a hang, not slowness.
         self.idle_timeout = idle_timeout
+        self.last_activity_at = 0.0
         self._dead_reason = ""
         self._client_factory = client_factory
         self._client: Any = None
@@ -185,6 +186,7 @@ class AdvisorSession:
                 got = self._extract_thread_id(result) or thread_id
                 self._thread_id = got
                 self._resumed = True
+                self.last_activity_at = time.monotonic()
                 logger.info("advisor: resumed codex thread %s", got[:8])
                 return got, True
             except Exception as exc:
@@ -324,6 +326,7 @@ class AdvisorSession:
             outcome.error = f"超时：{timeout:.0f}s 内未收到 turn/completed"
             self.interrupt()
 
+        self.last_activity_at = time.monotonic()
         outcome.text = final_text.strip()
         outcome.elapsed = time.monotonic() - started
         outcome.declined_approvals = self._declined
