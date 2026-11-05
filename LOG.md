@@ -33,3 +33,39 @@
 - 关键证据：doctor 输出、11 项测试全绿、DESIGN.md §1–§8
 - 当前状态：M0 完成，等启用 + 冒烟
 - Residual：R1–R6（见 PROJECT.md §6）
+
+### 2026-11-05 11:00–11:30 +0800 · M1：启用 + 真机验收（跑出 3 个真缺陷）
+
+- 执行周期：from 2026-11-05 11:00 +0800 to 2026-11-05 11:30 +0800（Asia/Shanghai）
+- 主机/身份：Hermes 容器（hermes@庄奕）
+- 授权：用户 2026-11-05「授权」（启用插件 + 重启 gateway）
+- 基线：`16094b6`（M0）
+
+**做了什么**
+
+- `hermes plugins enable hermes-codex-advisor`（未授予 `allow_tool_override`），回读 `plugins.enabled` 确认
+- 配置写进**正确子树** `plugins.entries.hermes-codex-advisor.settings.*`（`hermes config set`，7 项）
+- 用 s6 重启 gateway（`s6-svc -r /run/service/gateway-default`，容器 PID 1 = `s6-svscan`）；重启脚本自带兜底与日志 `/opt/data/logs/hca-restart.log`
+- 写三个验收工具：`hca_smoke.py`（同进程两轮 + `--recall` 跨进程）、`hca_probe_notifications.py`（直接 dump app-server 事件流）、`hca_plugin_harness.py`（fake ctx → `register()` → 真 handler）
+
+**真机跑出的 3 个缺陷（全部已修 + 回归）**
+
+1. **`model` 是插件设置的保留根键**（`hermes_cli/plugins_state.py: _PLUGIN_SETTING_RESERVED_ROOTS = {model, plugins, security, settings}`）→ `ctx.get_config("model")` 直接抛 `ValueError`，`codex_status` 一调用就崩。改：设置键全部改 `advisor_*`；抽 `advisor/config.py`，**逐键 try/except 降级到 DEFAULT**——读配置失败不该弄死顾问。commit `6d6c432`
+2. **`ask()` 自己解析线程 → 每第二轮静默丢上下文**：`ensure_thread(None)` 在已持有线程时被新语义解释为"要新线程"，于是第二轮跑在全新线程上、没有上下文，而返回的 `thread_id`/`resumed` 还是旧线程的——**谎报连续性**。改：`ask(text, thread_id=…)` 把线程设为必填，解析只归 `ensure_thread` 一处；commit `4d20d40`
+3. **注入 client 时投影器被关**（`self._projector = None`）→ 注入式测试/宿主永远拿到空答案。改：投影器恒开，Hermes 版不可用时退回内置 `_MinimalProjector`。commit `4d20d40`
+
+**验证（真 Codex，effort=max）**
+
+- E5 同进程两轮：thread `01a1a9ba…`，Q1 7.1s、Q2 3.3s，`same_thread/resumed/recall_mark` 全 true → PASS
+- E6 跨进程 resume：新进程仅凭 state.json 里的线程号，`resumed=true`，答出上一进程留的标记 → PASS
+- E7 插件路径 harness：3 tools + `/advisor` + 1 unload hook；`effort=high`/`timeout=240`/`session_key` 全部生效；真答 4.4s → PASS
+- 离线契约测试 11 → **20 项全绿**（新增：settings 保留根键不崩、注入式投影、ask 必填 thread、两轮共享同一线程且 `thread/start` 只发生 0 次）
+
+**顺带证实**
+
+- `thread/resume` 在 Codex 0.166 上**跨进程可用**，顾问的持久性是真的，不只是 digest 兜底
+- 顾问纪律有效：证据不足时如实回「证据不足，需要提供……」，不编
+
+- 发布/推送：插件仓库 `4d20d40`；协作中心同步
+- 当前状态：M1 完成，模型/effort 仍是 luna+max
+- Residual：R3（`/advisor` 参数路径）、R4（并发压测）、R5（L0–L4 分级）、R6（公开仓库）
