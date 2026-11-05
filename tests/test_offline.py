@@ -30,6 +30,7 @@ class FakeSession:
         self.error = error
         self._alive = True
         self.messages: list[str] = []
+        self.thread_ids_used: list[str] = []
         self.thread_id = ""
         self.closed = False
 
@@ -48,7 +49,9 @@ class FakeSession:
         self.thread_id = "thread-new-0001"
         return self.thread_id, False
 
-    def ask(self, text: str, *, timeout: float = 300.0) -> TurnOutcome:
+    def ask(self, text: str, *, thread_id: str = "", timeout: float = 300.0) -> TurnOutcome:
+        assert thread_id, "service must pass an explicit thread_id"
+        self.thread_ids_used.append(thread_id)
         self.messages.append(text)
         if self.error:
             return TurnOutcome(ok=False, error=self.error, thread_id=self.thread_id, elapsed=0.01)
@@ -211,6 +214,134 @@ class ServiceTests(unittest.TestCase):
             res = svc.ask("session:A", "   ")
             self.assertFalse(res.ok)
             self.assertEqual(sess.messages, [])
+
+
+class FakeClient:
+    """Minimal stand-in for CodexAppServerClient."""
+
+    def __init__(self, *, resume_ids=("t-live",), start_id="t-new"):
+        self.resume_ids = set(resume_ids)
+        self.start_id = start_id
+        self.calls: list[tuple[str, dict]] = []
+        self.notifications: list[dict] = []
+        self.server_requests: list[dict] = []
+
+    def initialize(self, **kw):
+        self.calls.append(("initialize", kw))
+
+    def is_alive(self):
+        return True
+
+    def request(self, method, params=None, timeout=None):
+        self.calls.append((method, params or {}))
+        if method == "thread/resume":
+            tid = (params or {}).get("threadId")
+            if tid in self.resume_ids:
+                return {"thread": {"id": tid}}
+            raise RuntimeError("thread not found")
+        if method == "thread/start":
+            return {"thread": {"id": self.start_id}}
+        if method == "turn/start":
+            return {"turn": {"id": "turn-1"}}
+        return {}
+
+    def notify(self, method, params=None):
+        self.calls.append((method, params or {}))
+
+    def respond(self, rid, payload):
+        self.calls.append(("respond", {"id": rid, "payload": payload}))
+
+    def respond_error(self, rid, code=0, message=""):
+        self.calls.append(("respond_error", {"id": rid, "code": code, "message": message}))
+
+    def take_notification(self, timeout=None):
+        return self.notifications.pop(0) if self.notifications else None
+
+    def take_server_request(self, timeout=None):
+        return self.server_requests.pop(0) if self.server_requests else None
+
+    def close(self):
+        pass
+
+
+def make_session(client: FakeClient):
+    from advisor.session import AdvisorSession
+
+    return AdvisorSession(
+        codex_bin="/bin/true", codex_home=None, model="gpt-6-luna", effort="max",
+        sandbox="read-only", client_factory=lambda **_: client,
+    )
+
+
+class SessionThreadTests(unittest.TestCase):
+    """ensure_thread must report continuity truthfully."""
+
+    def test_holding_the_same_thread_reports_resumed(self) -> None:
+        client = FakeClient()
+        sess = make_session(client)
+        tid, resumed = sess.ensure_thread("t-live")     # real resume
+        self.assertEqual(tid, "t-live")
+        self.assertTrue(resumed)
+        again_id, again_resumed = sess.ensure_thread("t-live")  # already in hand
+        self.assertEqual(again_id, "t-live")
+        self.assertTrue(again_resumed, "same live thread must report resumed=True, not a phantom restart")
+        self.assertEqual([c[0] for c in client.calls].count("thread/resume"), 1)
+
+    def test_unresumable_thread_falls_back_to_new(self) -> None:
+        client = FakeClient(resume_ids=())
+        sess = make_session(client)
+        tid, resumed = sess.ensure_thread("t-gone")
+        self.assertEqual(tid, "t-new")
+        self.assertFalse(resumed)
+
+    def test_no_requested_thread_starts_new_even_if_one_held(self) -> None:
+        client = FakeClient()
+        sess = make_session(client)
+        sess.ensure_thread("t-live")
+        tid, resumed = sess.ensure_thread(None)   # binding was reset -> fresh thread
+        self.assertEqual(tid, "t-new")
+        self.assertFalse(resumed)
+
+    def test_approval_requests_are_declined_not_ignored(self) -> None:
+        client = FakeClient()
+        client.notifications = [{"method": "turn/completed", "params": {"turn": {"status": "completed"}}}]
+        client.server_requests = [{"id": 7, "method": "item/commandExecution/requestApproval"}]
+        sess = make_session(client)
+        tid, _ = sess.ensure_thread(None)
+        outcome = sess.ask("hi", thread_id=tid, timeout=5)
+        self.assertFalse(outcome.ok)  # no text came back, and we say so
+        responses = [c for c in client.calls if c[0] == "respond"]
+        self.assertEqual(responses[0][1]["payload"], {"decision": "decline"})
+
+    def test_ask_requires_an_explicit_thread(self) -> None:
+        sess = make_session(FakeClient())
+        outcome = sess.ask("hi", thread_id="", timeout=1)
+        self.assertFalse(outcome.ok)
+        self.assertIn("thread_id", outcome.error)
+
+    def test_two_turns_share_one_thread_and_start_it_once(self) -> None:
+        """Regression: turn 2 used to be sent to a brand-new thread (silent context loss)."""
+        client = FakeClient()
+        client.notifications = [
+            {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "答一"}}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+            {"method": "item/completed", "params": {"item": {"type": "agentMessage", "text": "答二"}}},
+            {"method": "turn/completed", "params": {"turn": {"status": "completed"}}},
+        ]
+        sess = make_session(client)
+        tid, _ = sess.ensure_thread("t-live")
+        first = sess.ask("第一问", thread_id=tid, timeout=5)
+        tid2, resumed2 = sess.ensure_thread("t-live")
+        second = sess.ask("第二问", thread_id=tid2, timeout=5)
+
+        self.assertEqual(first.text, "答一")
+        self.assertEqual(second.text, "答二")
+        self.assertTrue(resumed2)
+        self.assertEqual(first.thread_id, second.thread_id)
+        methods = [c[0] for c in client.calls]
+        self.assertEqual(methods.count("thread/start"), 0, "an existing thread must never be re-started")
+        turn_calls = [c for c in client.calls if c[0] == "turn/start"]
+        self.assertEqual([c[1]["threadId"] for c in turn_calls], ["t-live", "t-live"])
 
 
 class PluginConfigTests(unittest.TestCase):

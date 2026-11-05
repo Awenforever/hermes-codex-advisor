@@ -108,12 +108,13 @@ class AdvisorSession:
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
+        # The projector is pure (notification -> messages); it stays on even when the
+        # transport is injected, otherwise an injected client would silently yield empty
+        # answers. Hermes' projector is used when importable, else a minimal local one.
+        self._projector = _make_projector()
         factory = self._client_factory
         if factory is None:
-            factory, projector_cls = _load_hermes_transport()
-            self._projector = projector_cls()
-        else:
-            self._projector = None
+            factory, _projector_cls = _load_hermes_transport()
         self._client = factory(
             codex_bin=self.codex_bin,
             codex_home=self.codex_home,
@@ -147,12 +148,16 @@ class AdvisorSession:
     def ensure_thread(self, thread_id: str | None) -> tuple[str, bool]:
         """Return ``(thread_id, resumed)``.
 
-        ``resumed=True`` only when Codex confirmed it knows the thread. Any failure is
-        reported (not raised) so the caller can fall back to a fresh thread *with a
-        digest* instead of silently losing continuity.
+        ``resumed=True`` only when the thread is actually carrying prior context: either
+        Codex confirmed the resume, or this process is already holding that very thread.
+        Anything else is reported (not raised) so the caller can fall back to a fresh
+        thread *with a digest* instead of silently losing continuity.
         """
-        if self._thread_id:
-            return self._thread_id, self._resumed
+        # Already holding exactly the requested thread: the context is live right here.
+        # Returning False here would make the caller announce a lost thread that never
+        # went missing (a real defect caught by the M1 smoke run).
+        if self._thread_id and thread_id == self._thread_id:
+            return self._thread_id, True
 
         client = self._ensure_client()
         if thread_id:
@@ -165,6 +170,7 @@ class AdvisorSession:
                 return got, True
             except Exception as exc:
                 logger.warning("advisor: thread/resume failed for %s: %s", thread_id[:8], exc)
+                self._thread_id = None
 
         result = client.request("thread/start", self._thread_start_params(), timeout=20)
         got = self._extract_thread_id(result)
@@ -195,17 +201,25 @@ class AdvisorSession:
         )
 
     # -- turn -------------------------------------------------------------
-    def ask(self, text: str, *, timeout: float = 300.0, poll: float = 0.25) -> TurnOutcome:
-        """Send one user message and block until the turn terminates."""
+    def ask(self, text: str, *, thread_id: str, timeout: float = 300.0, poll: float = 0.25) -> TurnOutcome:
+        """Send one user message to ``thread_id`` and block until the turn terminates.
+
+        The thread is a required argument on purpose: an earlier version resolved it
+        itself with ``ensure_thread(None)``, which — once a thread was already held —
+        started a *fresh* thread for every second question. The turn then ran without any
+        context while the caller was told the old thread was still in use. Silent context
+        loss is the one failure an advisor must never have, so the resolution lives in
+        exactly one place (``ensure_thread``) and this method takes its result.
+        """
         started = time.monotonic()
         outcome = TurnOutcome(ok=False)
-        try:
-            thread_id, _resumed = self.ensure_thread(None)
-        except AdvisorTransportError as exc:
-            outcome.error = str(exc)
+        if not thread_id:
+            outcome.error = "内部错误：ask() 需要显式 thread_id（线程解析只应由 ensure_thread 负责）"
             return outcome
-        except Exception as exc:  # subprocess/auth/network
-            outcome.error = f"app-server 不可用: {_short(exc)}"
+
+        if self._client is None:
+            # ensure_thread() spawns and initialises; refuse to guess here.
+            outcome.error = "内部错误：ask() 在 app-server 未初始化时被调用"
             return outcome
 
         outcome.thread_id = thread_id
@@ -308,6 +322,37 @@ class AdvisorSession:
             client.respond(rid, dict(canned))
         except Exception:
             logger.debug("advisor: respond failed", exc_info=True)
+
+
+class _MinimalProjector:
+    """Fallback projector: agent text only, used when Hermes' projector is unavailable."""
+
+    class _Result:
+        __slots__ = ("messages", "final_text", "is_tool_iteration")
+
+        def __init__(self, messages=None, final_text=None, is_tool_iteration=False):
+            self.messages = messages or []
+            self.final_text = final_text
+            self.is_tool_iteration = is_tool_iteration
+
+    def project(self, notification: dict) -> Any:
+        if notification.get("method") != "item/completed":
+            return self._Result()
+        item = (notification.get("params") or {}).get("item") or {}
+        if item.get("type") != "agentMessage":
+            return self._Result()
+        text = item.get("text") or ""
+        return self._Result(messages=[{"role": "assistant", "content": text}], final_text=text)
+
+
+def _make_projector() -> Any:
+    """Hermes' projector when available (native parity), otherwise a minimal one."""
+    try:
+        _client_cls, projector_cls = _load_hermes_transport()
+        return projector_cls()
+    except Exception as exc:  # pragma: no cover - only outside a Hermes install
+        logger.info("advisor: Hermes projector unavailable (%s); using minimal projector", exc)
+        return _MinimalProjector()
 
 
 class AdvisorTransportError(RuntimeError):

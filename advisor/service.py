@@ -186,7 +186,7 @@ class AdvisorService:
             message = "\n\n".join(parts)
 
             # 4) run it
-            outcome: TurnOutcome = session.ask(message, timeout=self.timeout)
+            outcome: TurnOutcome = session.ask(message, thread_id=thread_id, timeout=self.timeout)
             result.elapsed = outcome.elapsed
             result.turn_id = outcome.turn_id
             result.declined_approvals = outcome.declined_approvals
