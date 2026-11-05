@@ -122,3 +122,29 @@
 - 发布/推送：插件仓库 `75c0415`
 - 当前状态：M3 完成；L2/L3 待额度恢复后由 15:50 作业与下一次真机问答补
 - Residual：R5 关闭；R3（`/advisor` 参数路径）、R6（公开仓库）、R7（额度后复验 L2/L3）仍开
+
+### 2026-11-05 13:10–13:45 +0800 · M4：零 token 探测 + 空闲回收
+
+- 执行周期：from 2026-11-05 13:10 +0800 to 2026-11-05 13:45 +0800
+- 动机：额度 15:48 才恢复，任何"要真问一轮"的验证都做不了；但"我的历史还在吗"这个问题恰好**不需要额度**
+- 基线：`75c0415`
+
+**做了什么**
+
+1. **`codex_status(probe=true)`**：真的向 Codex 发 `thread/resume` 确认绑定线程是否还在。控制面调用、不进对话、**零 token**。返回 `thread_ok / resumed / elapsed / cost`，无绑定时明确说"还没绑定线程"
+2. **空闲进程回收** `advisor_idle_shutdown_seconds`（默认 900s）：长时间无问答关闭 app-server，线程留在 Codex 侧，下次提问 `thread/resume` 接回
+3. **digest 改双预算**：`advisor_digest_max_chars`（默认 6000）与轮数上限并存，从最新往回取；**最新一轮永远保留**
+4. 验收 L4 增三项：probe 无绑定明确报、probe 零 token 续上真实线程、看门狗触发路径如实分述
+
+**自己引入又自己抓到的竞态**
+
+`status()` 不持轮次锁却调用回收 → 若此刻正有一轮在跑，会把正在服务该轮的 app-server 关掉、直接杀死该轮。修法：回收前先试拿锁，**拿不到就不回收**；`ask()` 因为已持锁，显式传 `lock_held=True` 避免自锁。加了回归测试（持锁时调 status，断言会话没被关）。
+
+**验证（全部零额度）**
+
+- 离线契约测试 27 → **33 项全绿**
+- 真机 `hca_acceptance.py`：**L0 PASS / L1 PASS / L4 5 项 PASS**；L2/L3 仍 `BLOCKED(quota)`
+- probe 真机证据：对既有绑定 `m2:hang` 探测 → `thread_ok=true`，detail 写明「no tokens（thread/resume 是控制面调用，不进入对话）」
+
+- 发布/推送：插件仓库 `2b15420`，版本 0.3.0
+- Residual：R7（L2/L3 待额度）、R3（`/advisor` 参数路径）、R6（公开仓库）
