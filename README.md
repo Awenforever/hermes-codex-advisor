@@ -1,5 +1,7 @@
 # Hermes-Codex-Advisor
 
+> `https://github.com/Awenforever/hermes-codex-advisor` · MIT · Hermes `>=0.21.3` · Codex CLI `>=0.166`
+
 给 Hermes 执行体配一个**持久、只读、记得上下文**的 Codex 顾问。
 
 不是任务执行器：它不替你改代码、不跑批量任务。它是你在方案判断、难题攻坚、验收把关、方向纠偏时要的那个「问一句」——而且**聊过的东西它记得**。
@@ -21,7 +23,7 @@
 
 ```bash
 # 1. 放到插件目录
-git clone <repo> ~/.hermes/plugins/hermes-codex-advisor
+git clone https://github.com/Awenforever/hermes-codex-advisor ~/.hermes/plugins/hermes-codex-advisor
 
 # 2. 启用（不覆盖内置工具，最小权限）
 hermes plugins enable hermes-codex-advisor --no-allow-tool-override
