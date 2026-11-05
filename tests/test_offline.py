@@ -111,6 +111,27 @@ class StateTests(unittest.TestCase):
             self.assertIn("答三", digest)
             self.assertNotIn("问一", digest)  # only the last N turns
 
+    def test_digest_respects_the_char_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "state.json"))
+            b = store.get("s")
+            for i in range(4):
+                b.record(f"问题{i}-" + "细" * 400, "答案" + "节" * 400, keep=10)
+            budget = 1200
+            digest = b.digest(6, max_chars=budget)
+            self.assertLessEqual(len(digest), budget + 400, "budget overshoot means the replay could blow the prompt")
+            self.assertIn("问题3", digest)          # newest survives
+            self.assertNotIn("问题0", digest)       # oldest dropped by budget, not by turn count
+
+    def test_digest_always_keeps_one_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = StateStore(os.path.join(tmp, "state.json"))
+            b = store.get("s")
+            b.record("巨大问题" + "长" * 5000, "巨大答案" + "长" * 5000)
+            digest = b.digest(6, max_chars=500)
+            self.assertIn("巨大问题", digest)
+            self.assertLessEqual(len(digest), 900)
+
     def test_digest_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = StateStore(os.path.join(tmp, "state.json"))

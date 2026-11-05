@@ -128,23 +128,42 @@ class Binding:
             return "degraded"
         return "ok" if self.last_success_at else "idle"
 
-    def digest(self, turns: int = 6) -> str:
-        """Render recent Q/A as a compact replay block for a fresh thread."""
+    def digest(self, turns: int = 6, *, max_chars: int = 0) -> str:
+        """Render recent Q/A as a compact replay block for a fresh thread.
+
+        Two budgets, both enforced:
+        * ``turns`` — at most that many exchanges, newest kept;
+        * ``max_chars`` — when set, walk newest→oldest and stop adding once the block would
+          exceed it. Turn count alone is a bad budget: six turns with short questions cost
+          a few hundred tokens, six turns with pasted logs cost tens of thousands.
+
+        The newest exchange is always included (truncated if it alone overflows), because a
+        replay that drops the most recent context is worse than no replay at all.
+        """
         if not self.turns:
             return ""
         recent = self.turns[-turns:] if turns > 0 else []
-        lines = [
+        header = (
             "以下是此前与同一用户的历史问答（原线程不可用，摘要重放以保持连续性）。"
-            "把它们当作背景，不要逐条复述：",
-            "",
-        ]
-        for i, t in enumerate(recent, 1):
+            "把它们当作背景，不要逐条复述："
+        )
+        blocks: list[str] = []
+        used = len(header)
+        for t in reversed(recent):
             status = "（当时失败）" if t.error else ""
-            lines.append(f"Q{i}{status}: {t.question}")
+            block = f"Q{status}: {t.question}"
             if t.answer:
-                lines.append(f"A{i}: {t.answer}")
-            lines.append("")
-        return "\n".join(lines).strip()
+                block += f"\nA: {t.answer}"
+            cost = len(block) + 1
+            if max_chars and blocks and used + cost > max_chars:
+                break
+            if max_chars and not blocks and cost > max_chars:
+                block = block[: max(200, max_chars - 40)].rstrip() + "…（截断）"
+                cost = len(block) + 1
+            blocks.append(block)
+            used += cost
+        numbered = [f"[{i}] {b}" for i, b in enumerate(reversed(blocks), 1)]
+        return "\n\n".join([header, "", *numbered]).strip()
 
 
 class StateStore:

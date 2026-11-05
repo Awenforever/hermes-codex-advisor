@@ -101,6 +101,7 @@ class AdvisorService:
         timeout: float,
         digest_turns: int,
         max_answer_chars: int,
+        digest_max_chars: int = 6000,
         idle_timeout: float = 90.0,
         busy_wait: float = 5.0,
         retry_on_transport_failure: bool = True,
@@ -117,6 +118,7 @@ class AdvisorService:
         self.busy_wait = busy_wait
         self.retry_on_transport_failure = retry_on_transport_failure
         self.digest_turns = digest_turns
+        self.digest_max_chars = digest_max_chars
         self.max_answer_chars = max_answer_chars
         self._session_factory = session_factory
         self._session: Optional[AdvisorSession] = None
@@ -218,7 +220,7 @@ class AdvisorService:
         # 2) thread lost? fail-closed: new thread + digest, and SAY SO
         digest = ""
         if wanted and not resumed:
-            digest = binding.digest(self.digest_turns)
+            digest = binding.digest(self.digest_turns, max_chars=self.digest_max_chars)
             result.restarted = True
             result.notes.append(
                 f"原线程 {wanted[:8]} 已不可用（resume 失败），已新建线程并用最近 {len(binding.turns[-self.digest_turns:])} 轮问答摘要续接。"
@@ -252,7 +254,7 @@ class AdvisorService:
             result.notes.append(f"传输层失败（{outcome.error}）；已隔离该 app-server 并重启重试一次。")
             result.recovered = True
             # Fresh process needs a fresh thread; replay the digest so nothing is lost.
-            digest = binding.digest(self.digest_turns) or digest
+            digest = binding.digest(self.digest_turns, max_chars=self.digest_max_chars) or digest
             binding.thread_id = ""
             binding.restarts += 1
             session = self._get_session()
@@ -370,6 +372,7 @@ def build_service(config: dict[str, Any]) -> AdvisorService:
         cwd=cwd,
         timeout=float(config.get("timeout_seconds") or 300),
         digest_turns=int(config.get("digest_turns") or 6),
+        digest_max_chars=int(config.get("digest_max_chars") or 6000),
         max_answer_chars=int(config.get("max_answer_chars") or 12000),
         idle_timeout=float(config.get("idle_timeout_seconds") or 90),
         busy_wait=float(config.get("busy_wait_seconds") or 5),
